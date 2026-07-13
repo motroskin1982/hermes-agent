@@ -52,6 +52,7 @@ _ensure_telegram_mock()
 
 # Now we can safely import
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from telegram.error import BadRequest, Forbidden, TimedOut  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +177,111 @@ class TestDocumentTypeDetection:
         event = adapter.handle_message.call_args[0][0]
         assert event.message_type == MessageType.DOCUMENT
 
+
+class TestInboundMediaDownloadRetry:
+    @pytest.mark.asyncio
+    async def test_transient_get_file_failure_recovers(self, adapter, caplog):
+        file_obj = _make_file_obj(b"recovered")
+        source = MagicMock()
+        source.get_file = AsyncMock(
+            side_effect=[TimedOut("temporary timeout"), file_obj]
+        )
+
+        with patch("plugins.platforms.telegram.adapter.asyncio.sleep", new=AsyncMock()):
+            returned_file, data = await adapter._download_inbound_media(source, "voice")
+
+        assert returned_file is file_obj
+        assert data == bytearray(b"recovered")
+        assert source.get_file.await_count == 2
+        assert "temporary timeout" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_transient_download_failure_reacquires_file(self, adapter):
+        stale_file = _make_file_obj()
+        stale_file.download_as_bytearray = AsyncMock(
+            side_effect=TimedOut("temporary CDN timeout")
+        )
+        fresh_file = _make_file_obj(b"fresh")
+        source = MagicMock()
+        source.get_file = AsyncMock(side_effect=[stale_file, fresh_file])
+
+        with patch("plugins.platforms.telegram.adapter.asyncio.sleep", new=AsyncMock()):
+            returned_file, data = await adapter._download_inbound_media(source, "photo")
+
+        assert returned_file is fresh_file
+        assert data == bytearray(b"fresh")
+        assert source.get_file.await_count == 2
+        stale_file.download_as_bytearray.assert_awaited_once()
+        fresh_file.download_as_bytearray.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [BadRequest("file is invalid"), Forbidden("access denied")],
+        ids=["bad-request", "forbidden"],
+    )
+    async def test_permanent_failure_is_not_retried(self, adapter, error):
+        source = MagicMock()
+        source.get_file = AsyncMock(side_effect=error)
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.sleep", new=AsyncMock()
+        ) as sleep_mock, pytest.raises(type(error)):
+            await adapter._download_inbound_media(source, "document")
+
+        source.get_file.assert_awaited_once()
+        sleep_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_surfaces_exactly_one_fallback(self, adapter):
+        msg = _make_message()
+        msg.voice = MagicMock(file_size=100)
+        msg.voice.get_file = AsyncMock(side_effect=TimedOut("temporary timeout"))
+
+        with patch("plugins.platforms.telegram.adapter.asyncio.sleep", new=AsyncMock()):
+            await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        assert msg.voice.get_file.await_count == 3
+        msg.reply_text.assert_awaited_once()
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates_without_fallback(self, adapter):
+        msg = _make_message()
+        msg.voice = MagicMock(file_size=100)
+        msg.voice.get_file = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        msg.voice.get_file.assert_awaited_once()
+        msg.reply_text.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recovered_voice_reaches_cache_and_stt_event_path(self, adapter):
+        file_obj = _make_file_obj(b"ogg voice")
+        msg = _make_message()
+        msg.voice = MagicMock(file_size=100)
+        msg.voice.get_file = AsyncMock(
+            side_effect=[TimedOut("temporary timeout"), file_obj]
+        )
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.sleep", new=AsyncMock()
+        ), patch(
+            "plugins.platforms.telegram.adapter.cache_audio_from_bytes",
+            return_value="/tmp/recovered-voice.ogg",
+        ) as cache_mock:
+            await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        cache_mock.assert_called_once_with(b"ogg voice", ext=".ogg")
+        msg.reply_text.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == MessageType.VOICE
+        assert event.media_urls == ["/tmp/recovered-voice.ogg"]
+        assert event.media_types == ["audio/ogg"]
 
 # ---------------------------------------------------------------------------
 # TestDocumentDownloadBlock
