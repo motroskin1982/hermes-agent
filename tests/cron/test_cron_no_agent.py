@@ -280,6 +280,33 @@ def test_run_job_no_agent_never_invokes_aiagent(hermes_env):
     ai_mock.assert_not_called()
 
 
+def test_run_job_no_agent_passes_job_level_script_timeout(hermes_env):
+    """The stored per-job timeout must not be ignored by the no-agent path."""
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "timeout-job",
+        "name": "timeout job",
+        "script": "alert.sh",
+        "no_agent": True,
+        "script_timeout_seconds": 900,
+    }
+    seen = {}
+
+    def script_stub(path, *, timeout_seconds=None):
+        seen["path"] = path
+        seen["timeout_seconds"] = timeout_seconds
+        return True, "ok"
+
+    with patch.object(scheduler, "_run_job_script", side_effect=script_stub):
+        success, _doc, final_response, error = scheduler.run_job(job)
+
+    assert success is True
+    assert error is None
+    assert final_response == "ok"
+    assert seen == {"path": "alert.sh", "timeout_seconds": 900}
+
+
 # ---------------------------------------------------------------------------
 # _run_job_script: shell-script support
 # ---------------------------------------------------------------------------

@@ -195,6 +195,38 @@ class TestRunJobScript:
         assert success is False
         assert "timed out" in output.lower()
 
+    def test_explicit_job_timeout_overrides_global_timeout(self, cron_env, monkeypatch):
+        """A job-level timeout must reach subprocess.run instead of being ignored."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "timeout_probe.py"
+        script.write_text('print("ok")\n')
+        seen = {}
+
+        def fake_run(*args, **kwargs):
+            seen["timeout"] = kwargs["timeout"]
+            return sched_mod.subprocess.CompletedProcess(args=args[0], returncode=0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        success, output = _run_job_script(str(script), timeout_seconds=900)
+
+        assert success is True
+        assert output == "ok"
+        assert seen["timeout"] == 900
+
+    def test_script_timeout_alert_is_not_mislabeled_as_provider_failure(self):
+        from cron.scheduler import _summarize_cron_failure_for_delivery
+
+        message = _summarize_cron_failure_for_delivery(
+            {"name": "backup", "no_agent": True},
+            "Script timed out after 120s: /safe/backup.sh",
+        )
+
+        assert "script timeout" in message.lower()
+        assert "provider timeout" not in message.lower()
+        assert "fallback chain" not in message.lower()
+
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""
         from cron.scheduler import _run_job_script

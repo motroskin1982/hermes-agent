@@ -72,6 +72,17 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "Full details saved in cron output."
         )
 
+    # Pure script jobs have no provider or fallback chain. Classify these
+    # before the generic provider-timeout branch so operators are not sent a
+    # materially false diagnosis for a local subprocess timeout.
+    if job.get("no_agent") and (
+        "script timed out" in lower or "script timeout" in lower
+    ):
+        return (
+            f"⚠️ Cron '{job_name}' failed: script timeout. "
+            "No model provider was involved. Full details saved in cron output."
+        )
+
     if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
@@ -2011,7 +2022,9 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(
+    script_path: str, *, timeout_seconds: int | float | str | None = None
+) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -2068,6 +2081,23 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script path is not a file: {path}"
 
     script_timeout = _get_script_timeout()
+    if timeout_seconds is not None:
+        try:
+            explicit_timeout = int(float(timeout_seconds))
+            if explicit_timeout > 0:
+                script_timeout = explicit_timeout
+            else:
+                logger.warning(
+                    "Ignoring non-positive per-job script timeout %r; using %ss",
+                    timeout_seconds,
+                    script_timeout,
+                )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring invalid per-job script timeout %r; using %ss",
+                timeout_seconds,
+                script_timeout,
+            )
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -2135,6 +2165,14 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script execution failed: {exc}"
 
 
+def _run_job_script_for_job(job: dict, script_path: str) -> tuple[bool, str]:
+    """Run a job script while preserving legacy one-argument test/mocking paths."""
+    timeout_seconds = job.get("script_timeout_seconds")
+    if timeout_seconds is None:
+        return _run_job_script(script_path)
+    return _run_job_script(script_path, timeout_seconds=timeout_seconds)
+
+
 def _parse_wake_gate(script_output: str) -> bool:
     """Parse the last non-empty stdout line of a cron job's pre-check script
     as a wake gate.
@@ -2188,7 +2226,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script_for_job(job, script_path)
         if success:
             if script_output:
                 prompt = (
@@ -2542,7 +2580,7 @@ def run_job(
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script_for_job(job, script_path)
         finally:
             if _prior_cwd is not None:
                 try:
@@ -2631,7 +2669,7 @@ def run_job(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script_for_job(job, script_path)
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
