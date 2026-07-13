@@ -452,7 +452,16 @@ class TelegramAdapter(BasePlatformAdapter):
     INBOUND_MEDIA_DOWNLOAD_ATTEMPTS = 3
     INBOUND_MEDIA_RETRY_BASE_SECONDS = 0.25
     INBOUND_MEDIA_RETRY_MAX_SECONDS = 1.0
-    INBOUND_MEDIA_ATTEMPT_TIMEOUT_SECONDS = 45.0
+    # PTB otherwise applies its shorter request defaults (20s in the live
+    # installation) before our outer retry deadline can help.  Media fetches
+    # use explicit, bounded network budgets so a slow Telegram file endpoint
+    # gets a real chance to recover without hanging forever.
+    INBOUND_MEDIA_GET_FILE_READ_TIMEOUT_SECONDS = 90.0
+    INBOUND_MEDIA_DOWNLOAD_READ_TIMEOUT_SECONDS = 180.0
+    INBOUND_MEDIA_WRITE_TIMEOUT_SECONDS = 30.0
+    INBOUND_MEDIA_CONNECT_TIMEOUT_SECONDS = 30.0
+    INBOUND_MEDIA_POOL_TIMEOUT_SECONDS = 30.0
+    INBOUND_MEDIA_ATTEMPT_TIMEOUT_SECONDS = 240.0
     _GENERAL_TOPIC_THREAD_ID = "1"
 
     # Telegram's edit_message applies MarkdownV2 formatting only on the
@@ -5870,8 +5879,19 @@ class TelegramAdapter(BasePlatformAdapter):
         or degraded request cannot poison the next download attempt.
         """
         async def _download_once():
-            file_obj = await source.get_file()
-            data = await file_obj.download_as_bytearray()
+            request_timeouts = {
+                "write_timeout": self.INBOUND_MEDIA_WRITE_TIMEOUT_SECONDS,
+                "connect_timeout": self.INBOUND_MEDIA_CONNECT_TIMEOUT_SECONDS,
+                "pool_timeout": self.INBOUND_MEDIA_POOL_TIMEOUT_SECONDS,
+            }
+            file_obj = await source.get_file(
+                read_timeout=self.INBOUND_MEDIA_GET_FILE_READ_TIMEOUT_SECONDS,
+                **request_timeouts,
+            )
+            data = await file_obj.download_as_bytearray(
+                read_timeout=self.INBOUND_MEDIA_DOWNLOAD_READ_TIMEOUT_SECONDS,
+                **request_timeouts,
+            )
             return file_obj, data
 
         attempts = self.INBOUND_MEDIA_DOWNLOAD_ATTEMPTS

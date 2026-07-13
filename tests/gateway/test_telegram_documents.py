@@ -196,6 +196,29 @@ class TestInboundMediaDownloadRetry:
         assert "temporary timeout" not in caplog.text
 
     @pytest.mark.asyncio
+    async def test_download_uses_explicit_extended_telegram_timeouts(self, adapter):
+        file_obj = _make_file_obj(b"voice-bytes")
+        source = MagicMock()
+        source.get_file = AsyncMock(return_value=file_obj)
+
+        returned_file, data = await adapter._download_inbound_media(source, "voice")
+
+        assert returned_file is file_obj
+        assert data == bytearray(b"voice-bytes")
+        source.get_file.assert_awaited_once_with(
+            read_timeout=adapter.INBOUND_MEDIA_GET_FILE_READ_TIMEOUT_SECONDS,
+            write_timeout=adapter.INBOUND_MEDIA_WRITE_TIMEOUT_SECONDS,
+            connect_timeout=adapter.INBOUND_MEDIA_CONNECT_TIMEOUT_SECONDS,
+            pool_timeout=adapter.INBOUND_MEDIA_POOL_TIMEOUT_SECONDS,
+        )
+        file_obj.download_as_bytearray.assert_awaited_once_with(
+            read_timeout=adapter.INBOUND_MEDIA_DOWNLOAD_READ_TIMEOUT_SECONDS,
+            write_timeout=adapter.INBOUND_MEDIA_WRITE_TIMEOUT_SECONDS,
+            connect_timeout=adapter.INBOUND_MEDIA_CONNECT_TIMEOUT_SECONDS,
+            pool_timeout=adapter.INBOUND_MEDIA_POOL_TIMEOUT_SECONDS,
+        )
+
+    @pytest.mark.asyncio
     async def test_transient_download_failure_reacquires_file(self, adapter):
         stale_file = _make_file_obj()
         stale_file.download_as_bytearray = AsyncMock(
