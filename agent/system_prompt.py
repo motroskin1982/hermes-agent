@@ -468,6 +468,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if user_block:
                 volatile_parts.append(user_block)
 
+    project_memory_block = getattr(agent, "_project_memory_prompt", "")
+    if project_memory_block:
+        volatile_parts.append(project_memory_block)
+
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:
         try:

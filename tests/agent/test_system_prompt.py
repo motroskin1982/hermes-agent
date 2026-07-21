@@ -17,6 +17,7 @@ def _make_agent(**overrides):
         _kanban_worker_guidance="",
         _memory_store=None,
         _memory_manager=None,
+        _project_memory_prompt="",
         model="",
         provider="",
         platform="",
@@ -99,3 +100,27 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+def test_project_memory_is_injected_only_when_pre_resolved():
+    agent = _make_agent(_project_memory_prompt="PROJECT MEMORY — ruta-rent\nRUTA_ONLY")
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        parts = build_system_prompt_parts(agent)
+    assert "RUTA_ONLY" in parts["volatile"]
+
+
+def test_empty_project_memory_is_not_injected():
+    agent = _make_agent()
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        parts = build_system_prompt_parts(agent)
+    assert "PROJECT MEMORY" not in parts["volatile"]
