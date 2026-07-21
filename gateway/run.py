@@ -15751,6 +15751,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "protect_last_n"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
+        # Scoped project memory is rendered during AIAgent construction; a
+        # gateway cache hit must never preserve stale injected project context.
+        ("memory", "project_memory_enabled"),
+        ("memory", "project_memory_char_limit"),
     )
 
     _HONCHO_CACHE_BUSTING_KEYS = (

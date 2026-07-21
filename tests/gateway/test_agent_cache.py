@@ -243,6 +243,23 @@ class TestExtractCacheBustingConfig:
         assert out["compression.protect_last_n"] == 25
         assert out["compression.codex_app_server_auto"] == "hermes"
 
+    def test_project_memory_settings_bust_cached_agent_signature(self):
+        from gateway.run import GatewayRunner
+
+        base = {"memory": {"project_memory_enabled": False, "project_memory_char_limit": 1200}}
+        enabled = {"memory": {"project_memory_enabled": True, "project_memory_char_limit": 1200}}
+        resized = {"memory": {"project_memory_enabled": True, "project_memory_char_limit": 800}}
+        base_sig = GatewayRunner._extract_cache_busting_config(base)
+        enabled_sig = GatewayRunner._extract_cache_busting_config(enabled)
+        resized_sig = GatewayRunner._extract_cache_busting_config(resized)
+
+        assert base_sig["memory.project_memory_enabled"] is False
+        assert enabled_sig["memory.project_memory_enabled"] is True
+        assert enabled_sig["memory.project_memory_char_limit"] == 1200
+        assert resized_sig["memory.project_memory_char_limit"] == 800
+        assert base_sig != enabled_sig
+        assert enabled_sig != resized_sig
+
     def test_missing_keys_yield_none(self):
         """Absent config keys must produce None values (still contribute to signature)."""
         from gateway.run import GatewayRunner

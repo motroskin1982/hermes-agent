@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.context_compressor import ContextCompressor
+from agent.runtime_cwd import resolve_agent_cwd
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.model_metadata import (
@@ -1344,6 +1345,7 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    mem_config = {}
     if not skip_memory:
         try:
             mem_config = _agent_cfg.get("memory", {})
@@ -1359,6 +1361,42 @@ def init_agent(
                 agent._memory_store.load_from_disk()
         except Exception:
             pass  # Memory is optional -- don't break agent init
+
+    # Project memory is deliberately separate from mutable global memory.  It is
+    # read-only at runtime and resolves exactly one project from an explicit
+    # lane or a configured workdir prefix; ambiguity means no injection.
+    agent._project_memory_prompt = ""
+    agent._project_memory_slug = None
+    agent._project_memory_reason = "disabled"
+    if not skip_memory and bool(mem_config.get("project_memory_enabled", False)):
+        try:
+            from tools.project_memory import resolve_project_memory, resolve_project_memory_from_projects_db
+            # A messaging lane is a higher-confidence identity boundary than a
+            # process cwd.  For gateway sessions, never fall back to cwd when
+            # an explicit lane mapping is absent or ambiguous.
+            if platform and chat_id:
+                _project_resolution = resolve_project_memory(
+                    registry_path=get_hermes_home() / "memories" / "projects" / "registry.json",
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    max_chars=int(mem_config.get("project_memory_char_limit", 1200)),
+                )
+                if _project_resolution.reason != "exact_lane":
+                    _project_resolution = type(_project_resolution)(None, "", _project_resolution.reason)
+            else:
+                _project_resolution = resolve_project_memory_from_projects_db(
+                    workdir=resolve_agent_cwd(),
+                    memory_root=get_hermes_home() / "memories" / "projects",
+                    db_path=get_hermes_home() / "projects.db",
+                    max_chars=int(mem_config.get("project_memory_char_limit", 1200)),
+                )
+            agent._project_memory_prompt = _project_resolution.prompt_block
+            agent._project_memory_slug = _project_resolution.slug
+            agent._project_memory_reason = _project_resolution.reason
+        except Exception as _project_memory_error:
+            _ra().logger.warning("Project memory resolution ignored: %s", _project_memory_error)
+
     
 
 
