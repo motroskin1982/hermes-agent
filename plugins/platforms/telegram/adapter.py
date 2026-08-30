@@ -162,6 +162,7 @@ try:
         Application,
         CommandHandler,
         CallbackQueryHandler,
+        ChatJoinRequestHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
         filters,
@@ -180,6 +181,7 @@ except ImportError:
     Application = Any
     CommandHandler = Any
     CallbackQueryHandler = Any
+    ChatJoinRequestHandler = Any
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -3277,6 +3279,7 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            self._app.add_handler(ChatJoinRequestHandler(self._handle_chat_join_request))
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -7714,6 +7717,26 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
+
+    async def _handle_chat_join_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Emit only allowlisted join-request identifiers to observer plugins."""
+        del context
+        request = getattr(update, "chat_join_request", None)
+        chat = getattr(request, "chat", None)
+        user = getattr(request, "from_user", None)
+        private_chat_id = getattr(request, "user_chat_id", None)
+        if request is None or chat is None or user is None or private_chat_id is None:
+            return
+        self.emit_plugin_event(
+            "chat_join_request",
+            {
+                "schema_version": 1,
+                "chat_id": str(chat.id),
+                "user_id": str(user.id),
+                "private_chat_id": str(private_chat_id),
+                "update_id": int(getattr(update, "update_id", 0) or 0),
+            },
+        )
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
