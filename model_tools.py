@@ -39,6 +39,21 @@ logger = logging.getLogger(__name__)
 _WARNED_DISABLED_BUNDLES: set = set()
 
 
+def _explicit_no_tools() -> bool:
+    """True when this process was launched with an explicit empty tool surface.
+
+    ``hermes --no-tools`` / ``hermes chat --no-tools`` sets ``HERMES_NO_TOOLS=1``
+    (see ``cli.main``). That is a capability boundary the caller asked for by
+    name, and no code path may re-add a toolset to it — not even the kanban
+    lifecycle re-entry below.
+
+    Deliberately distinct from "no toolsets configured": an ``enabled_toolsets``
+    list that merely *resolved* to empty (platform_toolsets, assignee profile)
+    is still a configuration, and the kanban re-entry continues to serve it.
+    """
+    return os.environ.get("HERMES_NO_TOOLS") == "1"
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -322,6 +337,7 @@ def get_tool_definitions(
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            _explicit_no_tools(),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -366,7 +382,11 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if os.environ.get("HERMES_KANBAN_TASK") and "kanban" not in effective_enabled_toolsets:
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            and not _explicit_no_tools()
+            and "kanban" not in effective_enabled_toolsets
+        ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
             # must always receive the lifecycle handoff tools. Assignee
             # profiles may intentionally restrict their normal chat toolsets
