@@ -16733,6 +16733,7 @@ def main(
     q: str = None,
     image: str = None,
     toolsets: str = None,
+    no_tools: bool = False,
     skills: str | list[str] | tuple[str, ...] = None,
     model: str = None,
     provider: str = None,
@@ -16843,7 +16844,18 @@ def main(
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
     toolsets_list = None
-    if toolsets:
+    if no_tools:
+        if toolsets:
+            raise ValueError("--no-tools cannot be combined with --toolsets")
+        toolsets_list = []
+        # An explicit empty tool surface is a process-wide capability
+        # boundary, not a per-call preference. Publish it the same way the
+        # other boundary flags do (HERMES_SAFE_MODE, HERMES_IGNORE_RULES) so
+        # every downstream tool-resolution site — including ones that only
+        # see ``enabled_toolsets=[]`` and cannot tell "explicitly none" from
+        # "config resolved to none" — can refuse to re-add a toolset.
+        os.environ["HERMES_NO_TOOLS"] = "1"
+    elif toolsets:
         if isinstance(toolsets, str):
             toolsets_list = [t.strip() for t in toolsets.split(",")]
         elif isinstance(toolsets, (list, tuple)):
