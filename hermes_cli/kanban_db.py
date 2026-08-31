@@ -77,6 +77,7 @@ import os
 import re
 import random
 import secrets
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -2680,6 +2681,17 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                if initial_status == "blocked":
+                    # An explicit initial hold is a human/controller hold, not a
+                    # circuit-breaker state. Persist the sticky signal in the same
+                    # transaction as creation so recompute_ready can never expose
+                    # the task to a generic dispatcher between commits.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"reason": "explicit_initial_hold", "kind": "needs_input"},
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3691,6 +3703,15 @@ def release_stale_claims(
                 )
             continue
 
+        if not row["worker_pid"]:
+            untracked = _native_task_processes(get_current_board(), str(row["id"]))
+            if untracked:
+                _defer_reclaim_for_live_worker(
+                    conn, row["id"], row["claim_lock"], now,
+                    {"untracked_worker_pids": untracked, "terminated": False},
+                    reason="untracked_worker_alive",
+                )
+                continue
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
         )
@@ -3740,6 +3761,7 @@ def release_stale_claims(
                 run_id=run_id,
             )
             reclaimed += 1
+        _capacity_release_reclaimed_task(str(row["id"]))
     return reclaimed
 
 
@@ -3771,9 +3793,13 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    if not row["worker_pid"] and _native_task_processes(get_current_board(), task_id):
+        return False
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
+    if _worker_survived_termination(termination):
+        return False
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -3804,6 +3830,7 @@ def reclaim_task(
             payload,
             run_id=run_id,
         )
+    _capacity_release_reclaimed_task(task_id)
     # Operator intervention — they've looked at the task, so the
     # consecutive-failures counter is now stale. Give the next retry
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
@@ -4014,6 +4041,13 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    existing = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if existing is not None and existing["status"] == "done":
+        try:
+            _capacity_mark_terminal(task_id, "task_completed_retry")
+        except Exception:
+            _log.exception("kanban capacity: completion retry terminal mark failed for %s", task_id)
+        return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4156,6 +4190,12 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    try:
+        _capacity_mark_terminal(task_id, "task_completed")
+    except Exception:
+        # Completion is already durable. Retaining the lease is fail-closed;
+        # a later broker reconciliation may release it after process absence.
+        _log.exception("kanban capacity: failed to mark terminal lease for %s", task_id)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -4538,7 +4578,7 @@ def edit_completed_task_result(
     return True
 
 
-def block_task(
+def _block_task_impl(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -4751,6 +4791,26 @@ def block_task(
         reason=reason,
     )
     return True
+
+
+def block_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    kind: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    result = _block_task_impl(
+        conn, task_id, reason=reason, kind=kind, expected_run_id=expected_run_id,
+    )
+    row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row is not None and row["status"] in {"blocked", "todo", "triage"}:
+        try:
+            _capacity_mark_terminal(task_id, "task_blocked")
+        except Exception:
+            _log.exception("kanban capacity: failed to mark blocked lease terminal for %s", task_id)
+    return result
 
 
 
@@ -5204,7 +5264,7 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def _archive_task_impl(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -5228,6 +5288,17 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # for a later dispatcher tick.
     recompute_ready(conn)
     return True
+
+
+def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    result = _archive_task_impl(conn, task_id)
+    row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row is not None and row["status"] == "archived":
+        try:
+            _capacity_mark_terminal(task_id, "task_archived")
+        except Exception:
+            _log.exception("kanban capacity: failed to mark archived lease terminal for %s", task_id)
+    return result
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -6153,6 +6224,14 @@ def enforce_max_runtime(
                 except (ProcessLookupError, OSError):
                     pass
 
+        survivors = _native_task_processes(get_current_board(), str(tid))
+        if survivors:
+            _defer_reclaim_for_live_worker(
+                conn, tid, row["claim_lock"], now,
+                {"untracked_worker_pids": survivors, "terminated": False},
+                reason="max_runtime_worker_family_alive",
+            )
+            continue
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -6179,6 +6258,8 @@ def enforce_max_runtime(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
                 timed_out.append(tid)
+        if cur.rowcount == 1:
+            _capacity_release_reclaimed_task(str(tid))
         # Increment the unified failure counter. Outside the write_txn
         # above because ``_record_task_failure`` opens its own. If the
         # breaker trips, this flips the task ``ready → blocked`` and
@@ -6266,6 +6347,15 @@ def detect_stale_running(
         lock = row["claim_lock"] or ""
 
         # Terminate the worker if it's still host-local.
+        if not pid:
+            untracked = _native_task_processes(get_current_board(), str(tid))
+            if untracked:
+                _defer_reclaim_for_live_worker(
+                    conn, tid, lock, now,
+                    {"untracked_worker_pids": untracked, "terminated": False},
+                    reason="untracked_worker_alive",
+                )
+                continue
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
         )
@@ -6319,6 +6409,7 @@ def detect_stale_running(
             )
             reclaimed.append(tid)
 
+        _capacity_release_reclaimed_task(str(tid))
         # Intentionally NOT calling _record_task_failure here. Stale reclaim
         # is dispatcher-side detection of an absent heartbeat; the task is
         # going straight back to ``ready`` for re-dispatch. Counting it as
@@ -6495,6 +6586,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text)
                     )
+    for tid in [*crashed, *rate_limited]:
+        _capacity_release_reclaimed_task(str(tid))
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
     # ready → blocked with a ``gave_up`` event on top of the ``crashed``
@@ -6947,6 +7040,111 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _capacity_reserve_for_dispatch(board: Optional[str], task_id: str, profile: str):
+    """Return (broker_path, lease); (None, None) means broker disabled."""
+    from hermes_cli import kanban_capacity as _cap
+    path = _cap.configured_path()
+    if path is None:
+        return None, None
+    _cap.init_db(path)
+    board_slug = board or get_current_board()
+    _cap.reconcile_terminal_exits(
+        path,
+        no_worker_proof_fn=lambda b, t: not _native_task_processes(b, t),
+    )
+    if not _capacity_release_reclaimed_task(task_id, board=board_slug):
+        return path, None
+    return path, _cap.reserve(path, board=board_slug, task_id=task_id, profile=profile)
+
+
+def _capacity_release_dispatch(path, lease, reason: str) -> None:
+    if path is not None and lease is not None:
+        from hermes_cli import kanban_capacity as _cap
+        _cap.release(path, lease_id=lease["lease_id"], reason=reason, no_worker_proven=True)
+
+
+def _native_task_processes(board: str, task_id: str) -> list[int]:
+    matches: list[int] = []
+    for proc in Path("/proc").iterdir() if Path("/proc").exists() else []:
+        if not proc.name.isdigit() or int(proc.name) == os.getpid():
+            continue
+        try:
+            env = {}
+            for item in (proc / "environ").read_bytes().split(b"\0"):
+                if b"=" in item:
+                    key, value = item.split(b"=", 1)
+                    env[key.decode(errors="ignore")] = value.decode(errors="ignore")
+            if env.get("HERMES_KANBAN_BOARD") == board and env.get("HERMES_KANBAN_TASK") == task_id:
+                matches.append(int(proc.name))
+        except (OSError, ValueError):
+            continue
+    return matches
+
+
+def _capacity_release_reclaimed_task(task_id: str, *, board: Optional[str] = None) -> bool:
+    from hermes_cli import kanban_capacity as _cap
+    path = _cap.configured_path()
+    if path is None:
+        return True
+    board_slug = board or get_current_board()
+    if _native_task_processes(board_slug, task_id):
+        return False
+    try:
+        _cap.release_by_task(
+            path, board=board_slug, task_id=task_id, reason="worker_reclaimed",
+            no_worker_proven=True, include_reserved=False,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _contain_spawned_worker(pid: int, *, grace_seconds: float = 1.0) -> bool:
+    """Terminate a just-spawned worker before any claim/capacity rollback."""
+    pid = int(pid or 0)
+    if pid <= 1:
+        return True
+    try:
+        pgid = os.getpgid(pid)
+        sid = os.getsid(pid)
+    except ProcessLookupError:
+        return True
+    try:
+        if pgid == pid and sid == pid:
+            os.killpg(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.02)
+    try:
+        if pgid == pid and sid == pid:
+            os.killpg(pid, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.02)
+    return not _pid_alive(pid)
+
+
+def _capacity_mark_terminal(task_id: str, reason: str, board: Optional[str] = None) -> None:
+    from hermes_cli import kanban_capacity as _cap
+    path = _cap.configured_path()
+    if path is not None:
+        _cap.mark_terminal_by_task(
+            path, board=board or get_current_board(), task_id=task_id, reason=reason,
+        )
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -7270,9 +7468,29 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        capacity_path, capacity_lease = _capacity_reserve_for_dispatch(
+            board, row["id"], row_assignee,
+        )
+        if capacity_path is not None and capacity_lease is None:
+            continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            _capacity_release_dispatch(capacity_path, capacity_lease, "claim_failed")
             continue
+        if capacity_path is not None:
+            assert capacity_lease is not None
+            from hermes_cli import kanban_capacity as _cap
+            try:
+                _cap.bind(
+                    capacity_path, lease_id=capacity_lease["lease_id"], state="claimed",
+                    run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
+                )
+            except Exception as exc:
+                auto = _record_spawn_failure(conn, claimed.id, f"capacity claim bind: {exc}", failure_limit=failure_limit)
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                _capacity_release_dispatch(capacity_path, capacity_lease, "claimed_bind_failed")
+                continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -7286,6 +7504,7 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            _capacity_release_dispatch(capacity_path, capacity_lease, "workspace_failed")
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -7293,6 +7512,7 @@ def _dispatch_once_locked(
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        pid = None
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -7308,6 +7528,16 @@ def _dispatch_once_locked(
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
+            elif capacity_path is not None:
+                raise RuntimeError("capacity-bound spawn returned no pid")
+            if capacity_path is not None:
+                assert capacity_lease is not None and pid is not None
+                from hermes_cli import kanban_capacity as _cap
+                _cap.bind(
+                    capacity_path, lease_id=capacity_lease["lease_id"], state="running",
+                    run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
+                    worker_pid=int(pid),
+                )
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -7325,12 +7555,27 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            if pid and not _contain_spawned_worker(int(pid)):
+                # Preserve the running claim and active capacity lease. Reconciliation
+                # must adopt or contain the live child; never release its permit.
+                if capacity_path is not None and capacity_lease is not None:
+                    try:
+                        from hermes_cli import kanban_capacity as _cap
+                        _cap.bind(
+                            capacity_path, lease_id=capacity_lease["lease_id"], state="running",
+                            run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
+                            worker_pid=int(pid),
+                        )
+                    except Exception:
+                        pass
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            _capacity_release_dispatch(capacity_path, capacity_lease, "spawn_failed")
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
@@ -7362,9 +7607,29 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
+        capacity_path, capacity_lease = _capacity_reserve_for_dispatch(
+            board, row["id"], row["assignee"],
+        )
+        if capacity_path is not None and capacity_lease is None:
+            continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            _capacity_release_dispatch(capacity_path, capacity_lease, "review_claim_failed")
             continue
+        if capacity_path is not None:
+            assert capacity_lease is not None
+            from hermes_cli import kanban_capacity as _cap
+            try:
+                _cap.bind(
+                    capacity_path, lease_id=capacity_lease["lease_id"], state="claimed",
+                    run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
+                )
+            except Exception as exc:
+                auto = _record_spawn_failure(conn, claimed.id, f"capacity claim bind: {exc}", failure_limit=failure_limit)
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                _capacity_release_dispatch(capacity_path, capacity_lease, "claimed_bind_failed")
+                continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -7378,6 +7643,7 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            _capacity_release_dispatch(capacity_path, capacity_lease, "workspace_failed")
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -7391,6 +7657,7 @@ def _dispatch_once_locked(
         # review agent needs.
         claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        pid = None
         try:
             import inspect
             try:
@@ -7403,15 +7670,40 @@ def _dispatch_once_locked(
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
+            elif capacity_path is not None:
+                raise RuntimeError("capacity-bound review spawn returned no pid")
+            if capacity_path is not None:
+                assert capacity_lease is not None and pid is not None
+                from hermes_cli import kanban_capacity as _cap
+                _cap.bind(
+                    capacity_path, lease_id=capacity_lease["lease_id"], state="running",
+                    run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
+                    worker_pid=int(pid),
+                )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
+            if pid and not _contain_spawned_worker(int(pid)):
+                # Preserve the running claim and active capacity lease. Reconciliation
+                # must adopt or contain the live child; never release its permit.
+                if capacity_path is not None and capacity_lease is not None:
+                    try:
+                        from hermes_cli import kanban_capacity as _cap
+                        _cap.bind(
+                            capacity_path, lease_id=capacity_lease["lease_id"], state="running",
+                            run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
+                            worker_pid=int(pid),
+                        )
+                    except Exception:
+                        pass
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            _capacity_release_dispatch(capacity_path, capacity_lease, "review_spawn_failed")
     return result
 
 
@@ -7682,6 +7974,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -7786,6 +8079,32 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    if extra_env:
+        allowed_identity_keys = {
+            "HERMES_KANBAN_CAMPAIGN", "HERMES_CONTROLLER_ASSIGNMENT",
+            "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_PROFILE",
+            "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_KANBAN_LAUNCH_ID", "HERMES_KANBAN_WORKER_SESSION_ID",
+            "HERMES_SESSION_ID",
+        }
+        unknown = set(extra_env) - allowed_identity_keys
+        if unknown:
+            raise ValueError(f"unsupported worker identity env:{sorted(unknown)}")
+        normalized = {str(key): str(value) for key, value in extra_env.items()}
+        expected_exact = {
+            "HERMES_KANBAN_BOARD": resolved_board,
+            "HERMES_KANBAN_TASK": task.id,
+            "HERMES_PROFILE": profile_arg,
+        }
+        if task.current_run_id is not None:
+            expected_exact["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+        if task.claim_lock:
+            expected_exact["HERMES_KANBAN_CLAIM_LOCK"] = str(task.claim_lock)
+        for key, expected_value in expected_exact.items():
+            if key in normalized and normalized[key] != expected_value:
+                raise ValueError(f"worker identity mismatch:{key}")
+        env.update(normalized)
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
@@ -7820,6 +8139,11 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
+        # Kanban workers are automation, not human-facing one-shot chats.
+        # Quiet mode selects cli.main's machine-worker execution path, which
+        # preserves an in-process continuation_required checkpoint instead of
+        # printing its intermediate response and exiting.
+        "--quiet",
         "-q", prompt,
     ])
     # Redirect output to a per-task log under <board-root>/logs/.

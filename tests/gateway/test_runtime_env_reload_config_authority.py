@@ -37,6 +37,37 @@ def test_reload_runtime_env_preserves_config_max_turns(tmp_path: Path, monkeypat
     assert os.environ["HERMES_MAX_ITERATIONS"] == "9000"
 
 
+def test_reload_runtime_env_preserves_notification_timing_from_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "agent": {
+                    "gateway_notify_initial_delay": 60,
+                    "gateway_notify_interval": 300,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (hermes_home / ".env").write_text(
+        "HERMES_AGENT_NOTIFY_INITIAL_DELAY=7\n"
+        "HERMES_AGENT_NOTIFY_INTERVAL=9\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INITIAL_DELAY", "60")
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "300")
+
+    gateway_run._reload_runtime_env_preserving_config_authority()
+
+    assert gateway_run._long_running_notification_timing() == (60.0, 300.0)
+
+
 def test_reload_runtime_env_keeps_env_max_iterations_when_config_omits_key(
     tmp_path: Path, monkeypatch
 ) -> None:

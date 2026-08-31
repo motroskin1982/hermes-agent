@@ -40,6 +40,30 @@ def _goal_continuation_event(source, goal="finish the task"):
     )
 
 
+def test_runtime_checkpoint_result_does_not_retrigger_standing_goal():
+    """A continuation checkpoint is not a completed agent turn to judge.
+
+    Regression: the input-token checkpoint returned a non-empty internal
+    ``final_response``. The gateway treated it as ordinary progress, asked the
+    goal judge, and enqueued the same synthetic goal prompt until the 20-turn
+    goal budget was exhausted.
+    """
+    result = {
+        "final_response": "Session paused; continuation is required.",
+        "continuation_required": True,
+        "continuation_reason": "input_token_threshold",
+    }
+
+    assert not GatewayRunner._should_evaluate_goal_after_result(
+        result,
+        result["final_response"],
+    )
+    assert GatewayRunner._should_evaluate_goal_after_result(
+        {"final_response": "Implemented and verified the next step."},
+        "Implemented and verified the next step.",
+    )
+
+
 @pytest.mark.asyncio
 async def test_goal_status_notice_uses_adapter_send_with_thread_metadata():
     """Regression: /goal judge status must use BasePlatformAdapter.send().

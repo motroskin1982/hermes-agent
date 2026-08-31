@@ -167,3 +167,56 @@ def test_exit_backstop_releases_pid_file_and_runtime_lock(monkeypatch):
     assert exc_info.value.code == 78
     remove_pid.assert_called_once_with()
     release_lock.assert_called_once_with()
+
+
+def test_shutdown_hard_exit_worker_has_no_blocking_cleanup_before_exit(monkeypatch):
+    from gateway import status as gateway_status
+
+    sleep = Mock()
+    remove_pid = Mock()
+    release_lock = Mock()
+    monkeypatch.setattr(gateway_run.time, "sleep", sleep)
+    monkeypatch.setattr(gateway_status, "remove_pid_file", remove_pid)
+    monkeypatch.setattr(gateway_status, "release_gateway_runtime_lock", release_lock)
+    monkeypatch.setattr(gateway_run.os, "_exit", _raise_exit)
+
+    with pytest.raises(_ExitCalled) as exc_info:
+        gateway_run._shutdown_hard_exit_worker(180.0)
+
+    assert exc_info.value.code == 1
+    sleep.assert_called_once_with(180.0)
+    remove_pid.assert_not_called()
+    release_lock.assert_not_called()
+
+
+def test_shutdown_hard_exit_watchdog_arms_only_once(monkeypatch):
+    created = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.started = False
+            created.append(self)
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(gateway_run.threading, "Thread", FakeThread)
+    monkeypatch.setattr(gateway_run, "_shutdown_hard_exit_watchdog_armed", False)
+
+    assert gateway_run._arm_shutdown_hard_exit_watchdog(180.0) is True
+    assert gateway_run._arm_shutdown_hard_exit_watchdog(180.0) is False
+    assert len(created) == 1
+    assert created[0].kwargs["target"] is gateway_run._shutdown_hard_exit_worker
+    assert created[0].kwargs["args"] == (180.0,)
+    assert created[0].kwargs["daemon"] is True
+    assert created[0].started is True
+
+
+def test_shutdown_premarks_sessions_before_notification_await():
+    import inspect
+
+    source = inspect.getsource(gateway_run.GatewayRunner.stop)
+    assert source.index("mark_resume_pending") < source.index(
+        "_notify_active_sessions_of_shutdown"
+    )

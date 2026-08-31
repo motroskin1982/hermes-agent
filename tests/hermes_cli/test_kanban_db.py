@@ -212,6 +212,25 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # Task creation + status inference
 # ---------------------------------------------------------------------------
 
+def test_create_task_initial_blocked_is_sticky_under_recompute(kanban_home):
+    """An explicit initial human hold must never auto-promote before unblock."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="held", assignee="alice", initial_status="blocked")
+        created = kb.get_task(conn, tid)
+        assert created is not None
+        assert created.status == "blocked"
+        promoted = kb.recompute_ready(conn)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        event = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? AND kind IN ('blocked','unblocked') ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+    assert promoted == 0
+    assert task.status == "blocked"
+    assert event["kind"] == "blocked"
+
+
 def test_create_task_no_parents_is_ready(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship it", assignee="alice")
@@ -1111,6 +1130,25 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
         assert kb.get_task(conn, t).status == "running"
 
 
+def test_max_runtime_holds_running_while_exact_worker_family_survives(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb,"_pid_alive",lambda _pid:False)
+    survivors=[424242]
+    monkeypatch.setattr(kb,"_native_task_processes",lambda _board,_task:list(survivors))
+    with kb.connect() as conn:
+        host=kb._claimer_id().split(":",1)[0]
+        task_id=kb.create_task(conn,title="family",assignee="a",max_runtime_seconds=1)
+        kb.claim_task(conn,task_id,claimer=f"{host}:family")
+        run=kb.latest_run(conn,task_id); old=int(time.time())-10
+        conn.execute("UPDATE tasks SET started_at=?,worker_pid=? WHERE id=?",(old,999999,task_id))
+        conn.execute("UPDATE task_runs SET started_at=?,worker_pid=? WHERE id=?",(old,999999,run.id))
+        assert kb.enforce_max_runtime(conn,signal_fn=lambda _pid,_sig:None)==[]
+        assert kb.get_task(conn,task_id).status=="running"
+        survivors.clear()
+        conn.execute("UPDATE tasks SET claim_expires=1 WHERE id=?",(task_id,)); conn.commit()
+        assert kb.enforce_max_runtime(conn,signal_fn=lambda _pid,_sig:None)==[task_id]
+        assert kb.get_task(conn,task_id).status=="ready"
+
+
 def test_heartbeat_extends_claim(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
@@ -1740,6 +1778,76 @@ def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawna
         # Must return to ready so the next tick can retry.
         assert kb.get_task(conn, t).status == "ready"
         assert kb.get_task(conn, t).claim_lock is None
+
+
+def test_dispatch_pid_persist_failure_contains_child_before_releasing_capacity(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    capacity_db = tmp_path / "capacity.db"
+    monkeypatch.setenv("HERMES_KANBAN_CAPACITY_DB", str(capacity_db))
+    children = []
+    def spawn(_task, workspace):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time;time.sleep(30)"],
+            cwd=workspace, start_new_session=True,
+        )
+        children.append(proc)
+        return proc.pid
+    monkeypatch.setattr(kb, "_set_worker_pid", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("pid persist failed")))
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="pid boundary", assignee="alice")
+        kb.dispatch_once(conn, spawn_fn=spawn)
+        assert kb.get_task(conn, task_id).status == "ready"
+    assert len(children) == 1
+    children[0].wait(timeout=4)
+    con = sqlite3.connect(capacity_db)
+    state = con.execute("SELECT state FROM capacity_leases WHERE task_id=?", (task_id,)).fetchone()[0]
+    con.close()
+    assert state == "released"
+
+
+def test_dispatch_claimed_broker_bind_failure_releases_without_spawning(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_capacity as cap
+    capacity_db = tmp_path / "claimed-bind-capacity.db"
+    monkeypatch.setenv("HERMES_KANBAN_CAPACITY_DB", str(capacity_db))
+    original_bind = cap.bind
+    def fail_claimed(path, **kwargs):
+        if kwargs.get("state") == "claimed": raise RuntimeError("claimed bind failed")
+        return original_bind(path, **kwargs)
+    monkeypatch.setattr(cap, "bind", fail_claimed)
+    spawn_calls = []
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="claimed bind boundary", assignee="alice")
+        kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: spawn_calls.append(True))
+        assert kb.get_task(conn, task_id).status == "ready"
+    assert spawn_calls == []
+    con = sqlite3.connect(capacity_db); state = con.execute("SELECT state FROM capacity_leases WHERE task_id=?", (task_id,)).fetchone()[0]; con.close()
+    assert state == "released"
+
+
+def test_dispatch_running_broker_bind_failure_contains_child_before_release(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_capacity as cap
+    capacity_db = tmp_path / "bind-capacity.db"
+    monkeypatch.setenv("HERMES_KANBAN_CAPACITY_DB", str(capacity_db))
+    children = []
+    def spawn(_task, workspace):
+        proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"], cwd=workspace, start_new_session=True)
+        children.append(proc); return proc.pid
+    original_bind = cap.bind
+    def fail_running(path, **kwargs):
+        if kwargs.get("state") == "running": raise RuntimeError("running bind failed")
+        return original_bind(path, **kwargs)
+    monkeypatch.setattr(cap, "bind", fail_running)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="bind boundary", assignee="alice")
+        kb.dispatch_once(conn, spawn_fn=spawn)
+    children[0].wait(timeout=4)
+    con = sqlite3.connect(capacity_db); state = con.execute("SELECT state FROM capacity_leases WHERE task_id=?", (task_id,)).fetchone()[0]; con.close()
+    assert state == "released"
 
 
 def test_dispatch_max_spawn_counts_existing_running_tasks(
@@ -3756,6 +3864,76 @@ def test_dispatch_review_spawns_with_correct_skills(
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
     assert spawned_tasks[0].skills == ["sdlc-review"]
+
+
+def test_dispatch_review_pid_persist_failure_contains_child_before_releasing_capacity(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    capacity_db = tmp_path / "review-capacity.db"
+    monkeypatch.setenv("HERMES_KANBAN_CAPACITY_DB", str(capacity_db))
+    children = []
+    def spawn(_task, workspace, board=None):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time;time.sleep(30)"],
+            cwd=workspace, start_new_session=True,
+        )
+        children.append(proc); return proc.pid
+    monkeypatch.setattr(kb, "_set_worker_pid", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("pid persist failed")))
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review boundary", assignee="alice")
+        _set_task_status(conn, task_id, "review")
+        kb.dispatch_once(conn, spawn_fn=spawn)
+    children[0].wait(timeout=4)
+    con = sqlite3.connect(capacity_db)
+    state = con.execute("SELECT state FROM capacity_leases WHERE task_id=?", (task_id,)).fetchone()[0]
+    con.close()
+    assert state == "released"
+
+
+def test_dispatch_review_claimed_broker_bind_failure_releases_without_spawning(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_capacity as cap
+    capacity_db = tmp_path / "review-claimed-bind-capacity.db"
+    monkeypatch.setenv("HERMES_KANBAN_CAPACITY_DB", str(capacity_db))
+    original_bind = cap.bind
+    def fail_claimed(path, **kwargs):
+        if kwargs.get("state") == "claimed": raise RuntimeError("claimed bind failed")
+        return original_bind(path, **kwargs)
+    monkeypatch.setattr(cap, "bind", fail_claimed)
+    spawn_calls = []
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review claimed bind boundary", assignee="alice")
+        _set_task_status(conn, task_id, "review")
+        kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: spawn_calls.append(True))
+        assert kb.get_task(conn, task_id).status == "ready"
+    assert spawn_calls == []
+    con = sqlite3.connect(capacity_db); state = con.execute("SELECT state FROM capacity_leases WHERE task_id=?", (task_id,)).fetchone()[0]; con.close()
+    assert state == "released"
+
+
+def test_dispatch_review_running_broker_bind_failure_contains_child_before_release(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_capacity as cap
+    capacity_db = tmp_path / "review-bind-capacity.db"
+    monkeypatch.setenv("HERMES_KANBAN_CAPACITY_DB", str(capacity_db))
+    children = []
+    def spawn(_task, workspace, board=None):
+        proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"], cwd=workspace, start_new_session=True)
+        children.append(proc); return proc.pid
+    original_bind = cap.bind
+    def fail_running(path, **kwargs):
+        if kwargs.get("state") == "running": raise RuntimeError("running bind failed")
+        return original_bind(path, **kwargs)
+    monkeypatch.setattr(cap, "bind", fail_running)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review bind boundary", assignee="alice")
+        _set_task_status(conn, task_id, "review")
+        kb.dispatch_once(conn, spawn_fn=spawn)
+    children[0].wait(timeout=4)
+    con = sqlite3.connect(capacity_db); state = con.execute("SELECT state FROM capacity_leases WHERE task_id=?", (task_id,)).fetchone()[0]; con.close()
+    assert state == "released"
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):

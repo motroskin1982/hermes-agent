@@ -245,7 +245,13 @@ def try_acquire_active_session(
     """
     max_sessions = resolve_max_concurrent_sessions(config)
     lease_id = uuid.uuid4().hex
-    if max_sessions is None:
+    exclusive_session_id = bool(
+        metadata and (
+            metadata.get("exclusive_session_id")
+            or metadata.get("require_unique_session_id")
+        )
+    )
+    if max_sessions is None and not exclusive_session_id:
         return ActiveSessionLease(
             lease_id=lease_id,
             session_id=session_id,
@@ -276,7 +282,11 @@ def try_acquire_active_session(
         if pruned:
             logger.info("Pruned %d stale active session lease(s)", pruned)
         active_count = len(entries)
-        if active_count >= max_sessions:
+        if exclusive_session_id and any(str(item.get("session_id") or "") == str(session_id) for item in entries):
+            _write_entries(state_path, entries)
+            logger.warning("Refusing duplicate active session id for surface=%s", surface)
+            return None, f"Session {session_id} is already active."
+        if max_sessions is not None and active_count >= max_sessions:
             _write_entries(state_path, entries)
             logger.info(
                 "Active session limit reached: active=%d max=%d surface=%s",

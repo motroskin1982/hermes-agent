@@ -2755,6 +2755,8 @@ def run_job(
         chat_id="",
         chat_name="",
     )
+    from tools.environments.local import reset_attested_cron_identity, set_attested_cron_identity
+    _cron_identity_tokens = set_attested_cron_identity(job_id, _cron_session_id)
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
@@ -2788,6 +2790,29 @@ def run_job(
             job_id, _job_workdir,
         )
         _job_workdir = None
+
+    # The process-local cwd lock below protects TERMINAL_CWD. This separate
+    # kernel lock is durable cross-process writer admission per normalized
+    # worktree; a busy or unavailable lock fails closed without starting work.
+    _worktree_admission = None
+    if _job_workdir:
+        try:
+            from cron.worktree_admission import try_acquire_worktree
+            _worktree_admission = try_acquire_worktree(_job_workdir)
+        except BaseException as exc:
+            logger.error("Job '%s': WORKTREE_BUSY (admission unavailable): %s", job_id, exc)
+        if _worktree_admission is None:
+            clear_session_vars(_ctx_tokens)
+            reset_attested_cron_identity(_cron_identity_tokens)
+            for _var_name in _cron_delivery_vars:
+                _VAR_MAP[_var_name].set("")
+            busy_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                "**Status:** WORKTREE_BUSY\n\n"
+                "Skipped safely because another process owns this worktree's writer admission lock.\n"
+            )
+            return True, busy_doc, SILENT_MARKER, None
 
     # Snapshot the current env value BEFORE acquiring the lock so the finally
     # below can always restore it, even if an exception fires before we set the
@@ -3367,8 +3392,11 @@ def run_job(
             _terminal_cwd_lock.release_write()
         else:
             _terminal_cwd_lock.release_read()
-        # Clean up ContextVar session/delivery state for this job.
+        if _worktree_admission is not None:
+            _worktree_admission.release()
+        # Clean up ContextVar session/delivery and attested identity state.
         clear_session_vars(_ctx_tokens)
+        reset_attested_cron_identity(_cron_identity_tokens)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:

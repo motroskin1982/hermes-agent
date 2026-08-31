@@ -1204,6 +1204,20 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_allowed_chats"] = platform_cfg["group_allowed_chats"]
                 if plat == Platform.TELEGRAM and "allowed_topics" in platform_cfg:
                     bridged["allowed_topics"] = platform_cfg["allowed_topics"]
+                if plat == Platform.TELEGRAM and "groups" in platform_cfg:
+                    telegram_groups = platform_cfg["groups"]
+                    if isinstance(telegram_groups, dict):
+                        bridged["groups"] = {
+                            str(chat_id): group_cfg
+                            for chat_id, group_cfg in telegram_groups.items()
+                            if isinstance(group_cfg, dict)
+                        }
+                    else:
+                        logger.warning(
+                            "Ignoring invalid telegram.groups in config.yaml "
+                            "(expected mapping, got %s)",
+                            type(telegram_groups).__name__,
+                        )
                 if "free_response_channels" in platform_cfg:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
                 if "mention_patterns" in platform_cfg:

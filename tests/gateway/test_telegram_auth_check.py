@@ -216,6 +216,40 @@ def test_is_user_authorized_from_message_allow_from():
     assert adapter._is_user_authorized_from_message(msg) is False
 
 
+def test_group_sender_allowlist_can_extend_global_allowlist_for_one_chat():
+    """A family-group sender may be allowed without gaining global access."""
+    adapter = _make_adapter(
+        allow_from=["111"],
+        groups={"-100": {"allow_from": ["222"]}},
+    )
+
+    family_message = _make_message(from_user_id=222, chat_id=-100, chat_type="group")
+    other_group_message = _make_message(from_user_id=222, chat_id=-200, chat_type="group")
+    direct_message = _make_message(from_user_id=222, chat_id=222, chat_type="private")
+
+    assert adapter._is_user_authorized_from_message(family_message) is True
+    assert adapter._is_user_authorized_from_message(other_group_message) is False
+    assert adapter._is_user_authorized_from_message(direct_message) is False
+
+
+def test_group_sender_allowlist_applies_to_inline_callbacks():
+    """Group-scoped users may use buttons only inside their allowed group."""
+    adapter = _make_adapter(
+        allow_from=["111"],
+        groups={"-100": {"allow_from": ["222"]}},
+    )
+
+    assert adapter._is_callback_user_authorized(
+        "222", chat_id="-100", chat_type="group"
+    ) is True
+    assert adapter._is_callback_user_authorized(
+        "222", chat_id="-200", chat_type="group"
+    ) is False
+    assert adapter._is_callback_user_authorized(
+        "222", chat_id="222", chat_type="private"
+    ) is False
+
+
 def test_is_user_authorized_from_message_wildcard():
     """_is_user_authorized_from_message should accept wildcard '*'."""
     adapter = _make_adapter(allow_from=["*"])

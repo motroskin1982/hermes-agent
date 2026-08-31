@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import os
 
 import pytest
 
@@ -200,29 +201,38 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
     ]
 
 
-def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatch):
-    calls = []
-
+def test_quiet_single_query_kanban_continuation_reuses_session_then_non_kanban_runs_once(monkeypatch):
     import cli as cli_mod
 
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "_finalize_single_query",
+        lambda fake_cli: None,
+    )
+
+    continuation_calls = []
+    run_messages = []
+
     def run_conversation(*, user_message, conversation_history):
-        calls.append(("run", user_message, conversation_history))
-        return {
-            "final_response": "",
-            "error": "provider failed",
-            "failed": True,
-        }
+        run_messages.append((user_message, list(conversation_history), os.environ.get("HERMES_KANBAN_TASK")))
+        if len(run_messages) == 1:
+            return {"final_response": "", "continuation_required": True}
+        return {"final_response": "done", "continuation_required": False}
 
     class FakeCLI:
         def __init__(self, **_kwargs):
+            type(self).last_instance = self
             self.provider = "test-provider"
             self.model = "test-model"
             self.session_id = "quiet-session"
-            self.conversation_history = []
+            self.conversation_history = ["h1"]
             self._active_agent_route_signature = "same-route"
             self.agent = SimpleNamespace(
                 session_id="quiet-session",
                 platform="cli",
+                session_input_tokens=123456,
+                session_api_calls=17,
                 quiet_mode=False,
                 suppress_status_output=False,
                 stream_delta_callback=object(),
@@ -231,15 +241,15 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
             )
 
         def _claim_active_session(self, surface, *, stderr=False):
-            calls.append(("claim", surface, stderr))
+            continuation_calls.append(("claim", surface, stderr))
             return True
 
         def _ensure_runtime_credentials(self):
-            calls.append("credentials")
+            continuation_calls.append("credentials")
             return True
 
         def _resolve_turn_agent_config(self, effective_query):
-            calls.append(("resolve", effective_query))
+            continuation_calls.append(("resolve", effective_query))
             return {
                 "signature": "same-route",
                 "model": None,
@@ -248,23 +258,34 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
             }
 
         def _init_agent(self, **kwargs):
-            calls.append(("init", kwargs))
+            continuation_calls.append(("init", kwargs))
             return True
 
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
     monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
     monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
-    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        cli_mod,
-        "_finalize_single_query",
-        lambda fake_cli: calls.append(("finalize", fake_cli.session_id)),
-    )
 
     with pytest.raises(SystemExit) as exc_info:
         cli_mod.main(query="hello", quiet=True, toolsets="terminal")
 
-    assert exc_info.value.code == 1
-    assert ("claim", "cli", True) in calls
-    assert ("run", "hello", []) in calls
-    assert calls[-1] == ("finalize", "quiet-session")
+    assert exc_info.value.code == 0
+    assert len(run_messages) == 2
+    assert run_messages[0][0] == "hello"
+    assert run_messages[0][2] == "t_test_task_123"
+    assert run_messages[1][0] == (
+        "Continue this same Kanban task in the same session. Finish by calling kanban_complete or kanban_block."
+    )
+    assert run_messages[1][2] == "t_test_task_123"
+    assert FakeCLI.last_instance.agent.session_input_tokens == 0
+    assert FakeCLI.last_instance.agent.session_api_calls == 0
+    assert continuation_calls[0] == ("claim", "cli", True)
+
+    continuation_calls.clear()
+    run_messages.clear()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    with pytest.raises(SystemExit) as exc_info2:
+        cli_mod.main(query="hello", quiet=True, toolsets="terminal")
+
+    assert exc_info2.value.code == 0
+    assert len(run_messages) == 1

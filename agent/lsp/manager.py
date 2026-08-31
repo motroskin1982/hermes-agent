@@ -59,6 +59,8 @@ from agent.lsp.workspace import (
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
+DEFAULT_MAX_CLIENTS = 3
+DEFAULT_MAX_BASELINES = 512
 
 
 class _BackgroundLoop:
@@ -155,6 +157,8 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_clients: int = DEFAULT_MAX_CLIENTS,
+        max_baselines: int = DEFAULT_MAX_BASELINES,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -164,11 +168,11 @@ class LSPService:
         self._env_overrides = env_overrides or {}
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
-        self._idle_timeout = idle_timeout
+        self._idle_timeout = max(0.0, float(idle_timeout))
+        self._max_clients = max(1, int(max_clients))
+        self._max_baselines = max(32, int(max_baselines))
 
         self._loop = _BackgroundLoop()
-        if self._enabled:
-            self._loop.start()
 
         # Per-(server_id, workspace_root) state
         self._clients: Dict[Tuple[str, str], LSPClient] = {}
@@ -182,6 +186,18 @@ class LSPService:
         # out anything in the baseline so the agent only sees errors
         # introduced by the current edit.
         self._delta_baseline: Dict[str, List[Dict[str, Any]]] = {}
+        self._reaper_stop = threading.Event()
+        self._reaper_thread: Optional[threading.Thread] = None
+
+        if self._enabled:
+            self._loop.start()
+            if self._idle_timeout > 0:
+                self._reaper_thread = threading.Thread(
+                    target=self._reaper_main,
+                    name="hermes-lsp-reaper",
+                    daemon=True,
+                )
+                self._reaper_thread.start()
 
     @classmethod
     def create_from_config(cls) -> Optional["LSPService"]:
@@ -205,6 +221,18 @@ class LSPService:
         wait_mode = lsp_cfg.get("wait_mode", "document")
         wait_timeout = float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT))
         install_strategy = lsp_cfg.get("install_strategy", "auto")
+        try:
+            idle_timeout = float(lsp_cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT))
+        except (TypeError, ValueError):
+            idle_timeout = DEFAULT_IDLE_TIMEOUT
+        try:
+            max_clients = int(lsp_cfg.get("max_clients", DEFAULT_MAX_CLIENTS))
+        except (TypeError, ValueError):
+            max_clients = DEFAULT_MAX_CLIENTS
+        try:
+            max_baselines = int(lsp_cfg.get("max_baselines", DEFAULT_MAX_BASELINES))
+        except (TypeError, ValueError):
+            max_baselines = DEFAULT_MAX_BASELINES
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled = []
         binary_overrides: Dict[str, List[str]] = {}
@@ -235,6 +263,9 @@ class LSPService:
             env_overrides=env_overrides,
             init_overrides=init_overrides,
             disabled_servers=disabled,
+            idle_timeout=idle_timeout,
+            max_clients=max_clients,
+            max_baselines=max_baselines,
         )
 
     # ------------------------------------------------------------------
@@ -293,11 +324,11 @@ class LSPService:
             return
         try:
             diags = self._loop.run(self._snapshot_async(file_path), timeout=8.0)
-            self._delta_baseline[os.path.abspath(file_path)] = diags or []
+            self._set_delta_baseline(file_path, diags or [])
         except Exception as e:  # noqa: BLE001
             logger.debug("baseline snapshot failed for %s: %s", file_path, e)
             self._mark_broken_for_file(file_path, e)
-            self._delta_baseline[os.path.abspath(file_path)] = []
+            self._set_delta_baseline(file_path, [])
 
     def get_diagnostics_sync(
         self,
@@ -355,7 +386,8 @@ class LSPService:
 
         abs_path = os.path.abspath(file_path)
         if delta:
-            baseline = self._delta_baseline.get(abs_path) or []
+            with self._state_lock:
+                baseline = list(self._delta_baseline.get(abs_path) or [])
             if baseline:
                 if line_shift is not None:
                     # Remap baseline diagnostics into post-edit
@@ -375,7 +407,7 @@ class LSPService:
             except Exception:  # noqa: BLE001
                 fresh = []
             if fresh:
-                self._delta_baseline[abs_path] = fresh
+                self._set_delta_baseline(abs_path, fresh)
 
         if diags:
             eventlog.log_diagnostics(server_id, file_path, len(diags))
@@ -435,12 +467,35 @@ class LSPService:
         """Tear down all clients and stop the background loop."""
         if not self._enabled:
             return
+        self._reaper_stop.set()
+        if self._reaper_thread is not None:
+            self._reaper_thread.join(timeout=5.0)
         try:
             self._loop.run(self._shutdown_async(), timeout=10.0)
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP shutdown error: %s", e)
         self._loop.stop()
         clear_cache()
+
+    def _set_delta_baseline(self, file_path: str, diagnostics: List[Dict[str, Any]]) -> None:
+        """Store a bounded diagnostic baseline using insertion order as LRU."""
+        abs_path = os.path.abspath(file_path)
+        with self._state_lock:
+            self._delta_baseline.pop(abs_path, None)
+            self._delta_baseline[abs_path] = diagnostics
+            while len(self._delta_baseline) > self._max_baselines:
+                oldest = next(iter(self._delta_baseline))
+                self._delta_baseline.pop(oldest, None)
+
+    def _reaper_main(self) -> None:
+        """Periodically shut down LSP clients that have exceeded their lease."""
+        interval = max(5.0, min(60.0, self._idle_timeout / 2.0))
+        while not self._reaper_stop.wait(interval):
+            try:
+                self._loop.run(self._reap_idle_async(), timeout=30.0)
+            except Exception as exc:  # noqa: BLE001
+                if not self._reaper_stop.is_set():
+                    logger.debug("LSP idle reaper failed: %s", exc)
 
     # ------------------------------------------------------------------
     # async internals
@@ -517,6 +572,8 @@ class LSPService:
             except Exception:  # noqa: BLE001
                 return None
 
+        await self._evict_for_capacity_async(key)
+
         # Begin spawn
         loop = asyncio.get_running_loop()
         spawn_future: asyncio.Future = loop.create_future()
@@ -566,6 +623,44 @@ class LSPService:
             with self._state_lock:
                 self._spawning.pop(key, None)
 
+    async def _evict_for_capacity_async(self, incoming_key: Tuple[str, str]) -> None:
+        """Evict least-recently-used clients before admitting a new workspace."""
+        with self._state_lock:
+            excess = len(self._clients) - self._max_clients + 1
+            if excess <= 0:
+                return
+            candidates = sorted(
+                (key for key in self._clients if key != incoming_key),
+                key=lambda key: self._last_used.get(key, 0.0),
+            )[:excess]
+            clients = [self._clients.pop(key) for key in candidates]
+            for key in candidates:
+                self._last_used.pop(key, None)
+        if clients:
+            logger.info("LSP capacity reaper shutting down %d client(s)", len(clients))
+            await asyncio.gather(*(client.shutdown() for client in clients), return_exceptions=True)
+
+    async def _reap_idle_async(self) -> None:
+        now = time.time()
+        with self._state_lock:
+            stale_keys = [
+                key
+                for key in self._clients
+                if key not in self._spawning
+                and now - self._last_used.get(key, now) >= self._idle_timeout
+            ]
+            clients = [self._clients.pop(key) for key in stale_keys]
+            stale_roots = [key[1] for key in stale_keys]
+            for key in stale_keys:
+                self._last_used.pop(key, None)
+            if stale_roots:
+                for path in list(self._delta_baseline):
+                    if any(_path_is_within(path, root) for root in stale_roots):
+                        self._delta_baseline.pop(path, None)
+        if clients:
+            logger.info("LSP idle reaper shutting down %d client(s)", len(clients))
+            await asyncio.gather(*(client.shutdown() for client in clients), return_exceptions=True)
+
     async def _shutdown_async(self) -> None:
         with self._state_lock:
             clients = list(self._clients.values())
@@ -599,10 +694,21 @@ class LSPService:
             "wait_mode": self._wait_mode,
             "wait_timeout": self._wait_timeout,
             "install_strategy": self._install_strategy,
+            "idle_timeout": self._idle_timeout,
+            "max_clients": self._max_clients,
+            "max_baselines": self._max_baselines,
             "clients": clients,
             "broken": broken,
             "disabled_servers": sorted(self._disabled_servers),
         }
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    """Return whether *path* is inside *root* without prefix confusion."""
+    try:
+        return os.path.commonpath((os.path.abspath(path), os.path.abspath(root))) == os.path.abspath(root)
+    except (OSError, ValueError):
+        return False
 
 
 def _diag_key(d: Dict[str, Any]) -> str:

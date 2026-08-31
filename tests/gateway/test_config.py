@@ -1005,6 +1005,30 @@ class TestLoadGatewayConfig:
             "789": "Creative writing",
         }
 
+    def test_bridges_telegram_group_sender_allowlists_from_config_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  groups:\n"
+            '    "-1001234567":\n'
+            "      allow_from:\n"
+            '        - "111"\n'
+            '        - "222"\n',
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.TELEGRAM].extra["groups"] == {
+            "-1001234567": {"allow_from": ["111", "222"]}
+        }
+
     def test_bridges_slack_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

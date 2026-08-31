@@ -727,6 +727,63 @@ class TelegramAdapter(BasePlatformAdapter):
             return {}
         return {"disable_notification": True}
 
+    def _adapter_sender_policy_decision(
+        self,
+        user_id: str,
+        *,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+    ) -> Optional[bool]:
+        """Apply Telegram config sender allowlists before broader runner auth.
+
+        An exact ``groups.<chat_id>.allow_from`` list is authoritative inside
+        that group. Otherwise the top-level ``allow_from`` list is authoritative
+        platform-wide. ``None`` means this adapter has no sender policy and the
+        runner/pairing path should decide.
+        """
+        normalized_user_id = str(user_id or "").strip()
+        normalized_chat_id = str(chat_id or "").strip()
+        normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+        if normalized_chat_type == "private":
+            normalized_chat_type = "dm"
+        elif normalized_chat_type == "supergroup":
+            normalized_chat_type = "group"
+
+        def _is_allowed(raw_allowlist: Any) -> bool:
+            if isinstance(raw_allowlist, str):
+                values = {raw_allowlist.strip()} if raw_allowlist.strip() else set()
+            elif isinstance(raw_allowlist, (list, tuple, set)):
+                values = {str(item).strip() for item in raw_allowlist if str(item).strip()}
+            else:
+                values = set()
+            return normalized_user_id in values or "*" in values
+
+        if normalized_chat_type in {"group", "forum", "channel"} and normalized_chat_id:
+            groups = self.config.extra.get("groups")
+            if isinstance(groups, dict):
+                group_cfg = groups.get(normalized_chat_id)
+                if not isinstance(group_cfg, dict):
+                    lowered = normalized_chat_id.lower()
+                    group_cfg = next(
+                        (
+                            value
+                            for key, value in groups.items()
+                            if isinstance(key, str)
+                            and key.lower() == lowered
+                            and isinstance(value, dict)
+                        ),
+                        groups.get("*"),
+                    )
+                if isinstance(group_cfg, dict):
+                    if "allow_from" in group_cfg or "allowFrom" in group_cfg:
+                        sender_allow = group_cfg.get("allow_from", group_cfg.get("allowFrom"))
+                        return _is_allowed(sender_allow)
+
+        adapter_allow_from = self.config.extra.get("allow_from")
+        if adapter_allow_from is not None:
+            return _is_allowed(adapter_allow_from)
+        return None
+
     def _is_callback_user_authorized(
         self,
         user_id: str,
@@ -740,6 +797,12 @@ class TelegramAdapter(BasePlatformAdapter):
         normalized_user_id = str(user_id or "").strip()
         if not normalized_user_id:
             return False
+
+        adapter_decision = self._adapter_sender_policy_decision(
+            normalized_user_id, chat_id=chat_id, chat_type=chat_type
+        )
+        if adapter_decision is not None:
+            return adapter_decision
 
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
@@ -871,11 +934,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not user_id:
             return True
 
-        # Adapter-level allow_from: when set, it is the sole authority.
-        adapter_allow_from = self.config.extra.get("allow_from")
-        if adapter_allow_from is not None:
-            allowed = {str(u).strip() for u in adapter_allow_from if str(u).strip()}
-            return user_id in allowed or "*" in allowed
+        adapter_decision = self._adapter_sender_policy_decision(
+            user_id, chat_id=source.chat_id, chat_type=source.chat_type
+        )
+        if adapter_decision is not None:
+            return adapter_decision
 
         # Test/custom injection only. The class method named
         # _is_callback_user_authorized is for inline button callbacks and must

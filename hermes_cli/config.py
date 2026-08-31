@@ -1121,14 +1121,13 @@ DEFAULT_CONFIG = {
         # abandoned prompt — lower it if a single session must free up the
         # guard sooner.
         "clarify_timeout": 3600,
-        # Periodic "still working" notification interval (seconds).
-        # Sends a status message every N seconds so the user knows the
-        # agent hasn't died during long tasks.  0 = disable notifications.
-        # Lower values mean faster feedback on slow tasks but more chat
-        # noise; 180s is a compromise that catches spinning weak-model runs
-        # (60+ tool iterations with tiny output) before users assume the
-        # bot is dead and /restart.
-        "gateway_notify_interval": 180,
+        # Initial receipt and repeating "still working" timing (seconds).
+        # If a turn has no final answer after the initial delay, Hermes posts
+        # one editable acknowledgement. It then refreshes that same message at
+        # the repeat interval with elapsed time and current activity. Set the
+        # repeat interval to 0 to disable both notifications.
+        "gateway_notify_initial_delay": 60,
+        "gateway_notify_interval": 300,
         # Freshness window for the gateway auto-continue note (seconds).
         # After a gateway crash/restart/SIGTERM mid-run, the next user
         # message gets a "[System note: your previous turn was

@@ -69,6 +69,37 @@ class GatewayAuthorizationMixin:
             getattr(source, "profile", None),
         )
 
+    def _adapter_sender_policy_decision(
+        self,
+        source: Optional[SessionSource],
+    ) -> Optional[bool]:
+        """Return an adapter's exact sender-policy decision when available.
+
+        Some adapters apply a config-native sender gate before dispatching an
+        event. Telegram, for example, supports ``groups.<chat>.allow_from`` so
+        a collaborator can be admitted in one project group without joining
+        the platform-wide allowlist. Re-evaluate that exact user/chat policy
+        here so a stale service-level ``TELEGRAM_ALLOWED_USERS`` value cannot
+        reject an event the stricter adapter policy admitted.
+
+        ``None`` means the adapter exposes no such policy and the legacy env /
+        pairing checks below remain authoritative. An explicit ``False`` is a
+        deny and must not fall through to a broader chat allowlist.
+        """
+        adapter = self._adapter_for_source(source)
+        checker = getattr(adapter, "_adapter_sender_policy_decision", None)
+        if not callable(checker) or source is None:
+            return None
+        try:
+            decision = checker(
+                str(getattr(source, "user_id", "") or ""),
+                chat_id=getattr(source, "chat_id", None),
+                chat_type=getattr(source, "chat_type", None),
+            )
+        except Exception:
+            return None
+        return decision if isinstance(decision, bool) else None
+
     def _adapter_authorization_is_upstream(
         self,
         platform: Optional[Platform],
@@ -315,6 +346,16 @@ class GatewayAuthorizationMixin:
             return True
 
         user_id = source.user_id
+
+        # A config-native adapter sender policy is more specific than the
+        # process-wide env allowlists below. This is especially important for
+        # Telegram's exact ``groups.<chat_id>.allow_from`` contract: the adapter
+        # already applies it before dispatch, and the gateway must not then
+        # reject the same partner because systemd retained an owner-only global
+        # allowlist. An explicit False remains fail-closed in other chats/DMs.
+        adapter_sender_decision = self._adapter_sender_policy_decision(source)
+        if adapter_sender_decision is not None:
+            return adapter_sender_decision
 
         # Telegram (and similar) authorize entire group/forum/channel chats
         # by chat ID via TELEGRAM_GROUP_ALLOWED_CHATS / QQ_GROUP_ALLOWED_USERS.

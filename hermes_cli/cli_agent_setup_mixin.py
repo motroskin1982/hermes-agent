@@ -14,9 +14,52 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from rich.markup import escape as _escape
+
+
+def _reject_unauthorized_persisted_worker_session(cli_instance) -> None:
+    launch = getattr(cli_instance, "_kanban_worker_launch", None)
+    session_db = getattr(cli_instance, "_session_db", None)
+    if not launch or session_db is None:
+        return
+    if session_db.get_session(str(launch["worker_session_id"])):
+        raise RuntimeError("kanban worker persisted session collision")
+
+
+def _finalize_kanban_worker_agent_handshake(cli_instance) -> None:
+    """Publish proof that the real AIAgent adopted the controller session."""
+    launch = getattr(cli_instance, "_kanban_worker_launch", None)
+    if not launch:
+        return
+    expected = str(launch["worker_session_id"])
+    agent = getattr(cli_instance, "agent", None)
+    if (
+        agent is None
+        or str(getattr(cli_instance, "session_id", "")) != expected
+        or str(getattr(agent, "session_id", "")) != expected
+        or os.environ.get("HERMES_SESSION_ID") != expected
+    ):
+        raise RuntimeError("kanban worker agent session identity drift")
+    lease = getattr(cli_instance, "_active_session_lease", None)
+    if lease is None or not getattr(lease, "enabled", False):
+        raise RuntimeError("kanban worker exclusive session lease missing")
+    # Fixed workers may never rotate to a compression continuation session.
+    agent.compression_in_place = True
+    from hermes_cli.active_sessions import transfer_active_session
+
+    metadata = {
+        "exclusive_session_id": True,
+        "require_unique_session_id": True,
+        **launch,
+        "agent_initialized": True,
+        "agent_session_id": expected,
+    }
+    if not transfer_active_session(lease, session_id=expected, metadata=metadata):
+        raise RuntimeError("kanban worker agent handshake persistence failed")
+    cli_instance._kanban_agent_handshake = True
 
 
 class CLIAgentSetupMixin:
@@ -329,6 +372,7 @@ class CLIAgentSetupMixin:
             except Exception:
                 pass
         
+        _reject_unauthorized_persisted_worker_session(self)
         try:
             runtime = runtime_override or {
                 "api_key": self.api_key,
@@ -392,6 +436,7 @@ class CLIAgentSetupMixin:
                 notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction,
             )
+            _finalize_kanban_worker_agent_handshake(self)
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
             # local module global. ``_run_cleanup`` (in cli.py) reads

@@ -10482,6 +10482,21 @@ def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
     job = _call_cron_for_profile(selected, "trigger_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # A dashboard-triggered job is an explicit owner action.  Persisting a
+    # due timestamp alone waits for the periodic ticker, which can advance an
+    # interval job to its next occurrence before it is dispatched.  Kick one
+    # non-blocking tick in the same profile context; scheduler admission,
+    # worktree locks, claims, and in-flight dedup remain authoritative.
+    profile_name, home = _cron_profile_home(selected)
+    from cron import jobs as cron_jobs
+    from cron.scheduler import tick
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    override = set_hermes_home_override(str(home))
+    try:
+        with cron_jobs.use_cron_store(home):
+            tick(verbose=False, sync=False)
+    finally:
+        reset_hermes_home_override(override)
     return job
 
 

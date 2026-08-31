@@ -120,11 +120,16 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // redirect the user's text into a different chat (#54527).
       const startingActiveSessionId = activeSessionIdRef.current
       const startingStoredSessionId = selectedStoredSessionIdRef.current
-      const startingRouteToken = getRouteToken()
+      // These guards normally stay pinned to the context where submission
+      // began. A genuine new-chat create intentionally changes both the
+      // selected stored id and route, though, so rebase them after that create
+      // succeeds. Otherwise the guard mistakes our own navigation for a user
+      // session switch and silently aborts before prompt.submit.
+      let expectedStoredSessionId = startingStoredSessionId
+      let expectedRouteToken = getRouteToken()
 
       const sessionContextDrifted = (): boolean =>
-        selectedStoredSessionIdRef.current !== startingStoredSessionId ||
-        getRouteToken() !== startingRouteToken
+        selectedStoredSessionIdRef.current !== expectedStoredSessionId || getRouteToken() !== expectedRouteToken
 
       // One submit in flight per session — drop any concurrent re-fire so a
       // stalled turn can't stack the same prompt into multiple real turns.
@@ -281,10 +286,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           return false
         }
 
-        if (sessionContextDrifted()) {
-          return abortForSessionSwitch(sessionId)
-        }
-
         if (!sessionId) {
           dropOptimistic(null)
           releaseBusy()
@@ -292,6 +293,13 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
           return false
         }
+
+        // createBackendSessionForSend validates that the user did not switch
+        // context while session.create was in flight, then intentionally
+        // selects/navigates to the new stored session. From this point onward,
+        // that new identity is the context subsequent async work must protect.
+        expectedStoredSessionId = selectedStoredSessionIdRef.current
+        expectedRouteToken = getRouteToken()
 
         seedOptimistic(sessionId)
       }

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextvars import ContextVar
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
@@ -18,6 +19,32 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+ATTESTED_CRON_JOB_ID_ENV = "HERMES_ATTESTED_CRON_JOB_ID"
+ATTESTED_CRON_SESSION_ID_ENV = "HERMES_ATTESTED_CRON_SESSION_ID"
+_ATTESTED_CRON_JOB_ID: ContextVar[str | None] = ContextVar(ATTESTED_CRON_JOB_ID_ENV, default=None)
+_ATTESTED_CRON_SESSION_ID: ContextVar[str | None] = ContextVar(ATTESTED_CRON_SESSION_ID_ENV, default=None)
+
+
+def set_attested_cron_identity(job_id: str, session_id: str) -> tuple:
+    """Bind scheduler-owned identity for terminal subprocess calls."""
+    return (_ATTESTED_CRON_JOB_ID.set(job_id), _ATTESTED_CRON_SESSION_ID.set(session_id))
+
+
+def reset_attested_cron_identity(tokens: tuple) -> None:
+    _ATTESTED_CRON_JOB_ID.reset(tokens[0])
+    _ATTESTED_CRON_SESSION_ID.reset(tokens[1])
+
+
+def _inject_attested_cron_identity(env: dict) -> None:
+    """Overlay only context-local scheduler attestations; never global env."""
+    env.pop(ATTESTED_CRON_JOB_ID_ENV, None)
+    env.pop(ATTESTED_CRON_SESSION_ID_ENV, None)
+    job_id = _ATTESTED_CRON_JOB_ID.get()
+    session_id = _ATTESTED_CRON_SESSION_ID.get()
+    if job_id is not None and session_id is not None:
+        env[ATTESTED_CRON_JOB_ID_ENV] = job_id
+        env[ATTESTED_CRON_SESSION_ID_ENV] = session_id
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -387,6 +414,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    _inject_attested_cron_identity(sanitized)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
@@ -835,6 +863,7 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    _inject_attested_cron_identity(run_env)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)

@@ -1,8 +1,11 @@
 """Tests for hermes_cli.gateway."""
 
 import argparse
+import os
 import signal
+import subprocess
 import sys
+import textwrap
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -10,9 +13,14 @@ import pytest
 import hermes_cli.gateway as gateway
 
 
-def _install_fake_gateway_run(monkeypatch, start_gateway):
+def _install_fake_gateway_run(monkeypatch, start_gateway, hard_exit=None):
     module = ModuleType("gateway.run")
     module.start_gateway = start_gateway
+    if hard_exit is None:
+        def hard_exit(code):
+            if code:
+                raise SystemExit(code)
+    module._exit_after_graceful_shutdown = hard_exit
     monkeypatch.setitem(sys.modules, "gateway.run", module)
     # ``run_gateway()`` calls ``refresh_systemd_unit_if_needed()`` on every
     # invocation so that restart settings stay current after exit-code-75
@@ -59,6 +67,143 @@ def test_run_gateway_exits_cleanly_on_keyboard_interrupt(monkeypatch, capsys):
     assert calls == [(False, 0)]
     assert "Press Ctrl+C to stop" in out
     assert "Gateway stopped." in out
+
+
+def test_run_gateway_routes_clean_return_through_hard_exit(monkeypatch):
+    exit_codes = []
+
+    def fake_start_gateway(*, replace, verbosity):
+        return object()
+
+    _install_fake_gateway_run(monkeypatch, fake_start_gateway, exit_codes.append)
+    monkeypatch.setattr(gateway.asyncio, "run", lambda coro: True)
+
+    gateway.run_gateway()
+
+    assert exit_codes == [0]
+
+
+def test_run_gateway_routes_keyboard_interrupt_through_hard_exit(monkeypatch):
+    exit_codes = []
+
+    def fake_start_gateway(*, replace, verbosity):
+        return object()
+
+    def raise_keyboard_interrupt(coro):
+        raise KeyboardInterrupt
+
+    _install_fake_gateway_run(monkeypatch, fake_start_gateway, exit_codes.append)
+    monkeypatch.setattr(gateway.asyncio, "run", raise_keyboard_interrupt)
+
+    gateway.run_gateway()
+
+    assert exit_codes == [0]
+
+
+@pytest.mark.parametrize(
+    ("system_exit_code", "expected_code"),
+    [(None, 0), (75, 75), (78, 78), ("fatal", 1)],
+)
+def test_run_gateway_routes_system_exit_through_hard_exit(
+    monkeypatch,
+    system_exit_code,
+    expected_code,
+):
+    exit_codes = []
+
+    def fake_start_gateway(*, replace, verbosity):
+        return object()
+
+    def raise_system_exit(coro):
+        raise SystemExit(system_exit_code)
+
+    _install_fake_gateway_run(monkeypatch, fake_start_gateway, exit_codes.append)
+    monkeypatch.setattr(gateway.asyncio, "run", raise_system_exit)
+
+    gateway.run_gateway()
+
+    assert exit_codes == [expected_code]
+
+
+def test_canonical_cli_exit_does_not_join_wedged_non_daemon_thread(tmp_path):
+    sitecustomize = textwrap.dedent(
+        """
+        import sys
+        import threading
+        from types import ModuleType
+
+        import gateway.run as real_gateway_run
+        import hermes_cli.gateway as gateway
+
+        async def fake_start_gateway(*, replace, verbosity):
+            return False
+
+        fake_module = ModuleType("gateway.run")
+        fake_module.start_gateway = fake_start_gateway
+        fake_module._exit_after_graceful_shutdown = (
+            real_gateway_run._exit_after_graceful_shutdown
+        )
+        sys.modules["gateway.run"] = fake_module
+
+        gateway._guard_official_docker_root_gateway = lambda: None
+        gateway._guard_named_profile_under_multiplexer = lambda **kwargs: None
+        gateway._guard_supervised_gateway_conflict = lambda **kwargs: None
+        gateway._guard_existing_gateway_process_conflict = lambda **kwargs: None
+        gateway.supports_systemd_services = lambda: False
+
+        blocker = threading.Event()
+        threading.Thread(target=blocker.wait, daemon=False).start()
+        """
+    )
+    (tmp_path / "sitecustomize.py").write_text(sitecustomize, encoding="utf-8")
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    env["HERMES_GATEWAY_EXIT_DIAG"] = "0"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(tmp_path), str(gateway.PROJECT_ROOT), env.get("PYTHONPATH", "")]
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "gateway",
+            "run",
+            "--quiet",
+            "--replace",
+            "--force",
+        ],
+        cwd=gateway.PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 1
+
+
+def test_run_gateway_reraises_unexpected_base_exception(monkeypatch):
+    exit_codes = []
+
+    class UnexpectedShutdown(BaseException):
+        pass
+
+    def fake_start_gateway(*, replace, verbosity):
+        return object()
+
+    def raise_unexpected(coro):
+        raise UnexpectedShutdown("boom")
+
+    _install_fake_gateway_run(monkeypatch, fake_start_gateway, exit_codes.append)
+    monkeypatch.setattr(gateway.asyncio, "run", raise_unexpected)
+
+    with pytest.raises(UnexpectedShutdown, match="boom"):
+        gateway.run_gateway()
+
+    assert exit_codes == []
 
 
 def test_run_gateway_exits_nonzero_when_start_gateway_reports_failure(monkeypatch):

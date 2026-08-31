@@ -655,6 +655,106 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _long_running_notification_timing() -> tuple[Optional[float], Optional[float]]:
+    """Return the first receipt delay and repeating reminder interval.
+
+    A separate initial delay lets the gateway acknowledge a slow turn after one
+    minute without posting a new message every minute for the rest of the run.
+    A non-positive repeat interval preserves the historical all-or-nothing
+    disable switch.
+    """
+    repeat_interval = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 300)
+    if repeat_interval <= 0:
+        return None, None
+    initial_delay = _float_env("HERMES_AGENT_NOTIFY_INITIAL_DELAY", 60)
+    if initial_delay <= 0:
+        initial_delay = repeat_interval
+    return initial_delay, repeat_interval
+
+
+def _format_long_running_notification(
+    *,
+    first: bool,
+    elapsed_minutes: int,
+    status_detail: str,
+    repeat_interval: float,
+) -> str:
+    """Build the owner-facing slow-turn receipt or reminder text."""
+    if first:
+        repeat_minutes = max(1, round(repeat_interval / 60))
+        unit = "minute" if repeat_minutes == 1 else "minutes"
+        return (
+            f"✅ Message received — not forgotten. Still working "
+            f"({elapsed_minutes} min){status_detail}. "
+            f"I’ll keep this status updated every {repeat_minutes} {unit}."
+        )
+    return (
+        f"⏳ Not forgotten — still working "
+        f"({elapsed_minutes} min){status_detail}"
+    )
+
+
+async def _deliver_long_running_notification(
+    *,
+    adapter: Any,
+    chat_id: str,
+    text: str,
+    metadata: Optional[dict],
+    heartbeat_message_id: Optional[str],
+    first_notification: bool,
+    should_continue: Optional[Callable[[], bool]] = None,
+) -> tuple[Optional[str], bool]:
+    """Send or edit one heartbeat while preserving receipt state on failure."""
+    if should_continue is not None and not should_continue():
+        return heartbeat_message_id, first_notification
+    result = None
+    if heartbeat_message_id:
+        try:
+            result = await adapter.edit_message(
+                chat_id,
+                heartbeat_message_id,
+                text,
+            )
+        except Exception as exc:
+            logger.debug("Heartbeat edit failed: %s", exc)
+    if not (result and getattr(result, "success", False)):
+        # Recheck after an awaited edit: ownership or final-delivery state can
+        # change while I/O is in flight, and a stale fallback send is worse
+        # than omitting the heartbeat.
+        if should_continue is not None and not should_continue():
+            return heartbeat_message_id, first_notification
+        try:
+            result = await adapter.send(
+                chat_id,
+                text,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.debug("Long-running notification error: %s", exc)
+            return heartbeat_message_id, first_notification
+    if not (result and getattr(result, "success", False)):
+        return heartbeat_message_id, first_notification
+    delivered_message_id = getattr(result, "message_id", None)
+    if delivered_message_id:
+        heartbeat_message_id = str(delivered_message_id)
+    return heartbeat_message_id, False
+
+
+def _stream_final_delivery_confirmed(stream_consumer_holder: Any) -> bool:
+    """Safely read final-delivery state shared by the sync and async lanes."""
+    try:
+        consumer = stream_consumer_holder[0]
+    except (IndexError, TypeError):
+        return False
+    return bool(
+        consumer
+        and (
+            getattr(consumer, "final_response_sent", False)
+            or getattr(consumer, "final_content_delivered", False)
+        )
+    )
+
+
 def _is_fresh_gateway_interruption(
     value: Any,
     *,
@@ -1341,7 +1441,7 @@ def _reload_runtime_env_preserving_config_authority() -> None:
 
 
 def _bridge_max_turns_from_config(home: "Path") -> None:
-    """Bridge config.yaml agent.max_turns into HERMES_MAX_ITERATIONS (a global)."""
+    """Restore config-authoritative agent settings after each .env reload."""
     config_path = home / 'config.yaml'
     if not config_path.exists():
         return
@@ -1364,8 +1464,18 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
         return
 
     agent_cfg = cfg.get("agent", {})
-    if isinstance(agent_cfg, dict) and "max_turns" in agent_cfg:
+    if not isinstance(agent_cfg, dict):
+        return
+    if "max_turns" in agent_cfg:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
+    if "gateway_notify_initial_delay" in agent_cfg:
+        os.environ["HERMES_AGENT_NOTIFY_INITIAL_DELAY"] = str(
+            agent_cfg["gateway_notify_initial_delay"]
+        )
+    if "gateway_notify_interval" in agent_cfg:
+        os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(
+            agent_cfg["gateway_notify_interval"]
+        )
 
 
 def _current_max_iterations() -> int:
@@ -1590,6 +1700,10 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
             if "gateway_notify_interval" in _agent_cfg:
                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
+            if "gateway_notify_initial_delay" in _agent_cfg:
+                os.environ["HERMES_AGENT_NOTIFY_INITIAL_DELAY"] = str(
+                    _agent_cfg["gateway_notify_initial_delay"]
+                )
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
             if "gateway_auto_continue_freshness" in _agent_cfg:
@@ -1783,6 +1897,50 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# A direct SIGTERM does not put systemd into a stop job, so TimeoutStopSec does
+# not apply. If graceful teardown wedges after receiving the signal, this
+# daemon-thread backstop terminates the process and lets Restart=always revive
+# the canonical service. Three minutes is far above the normal zero-second
+# drain plus bounded adapter/database cleanup, while still recovering far
+# sooner than the 20+ minute shutdown limbo observed in production.
+_SHUTDOWN_HARD_EXIT_TIMEOUT_SECS = 180.0
+_shutdown_hard_exit_watchdog_lock = threading.Lock()
+_shutdown_hard_exit_watchdog_armed = False
+
+
+def _shutdown_hard_exit_worker(timeout_seconds: float) -> None:
+    time.sleep(max(0.0, timeout_seconds))
+    # Nothing may run between the deadline and os._exit: logging, imports,
+    # filesystem cleanup, and lock acquisition can all wedge on the same
+    # shutdown failure this backstop exists to escape. The kernel releases the
+    # runtime flock on process exit; the next gateway removes the stale PID file.
+    os._exit(1)
+
+
+def _arm_shutdown_hard_exit_watchdog(
+    timeout_seconds: float = _SHUTDOWN_HARD_EXIT_TIMEOUT_SECS,
+) -> bool:
+    global _shutdown_hard_exit_watchdog_armed
+    with _shutdown_hard_exit_watchdog_lock:
+        if _shutdown_hard_exit_watchdog_armed:
+            return False
+        _shutdown_hard_exit_watchdog_armed = True
+    try:
+        watchdog = threading.Thread(
+            target=_shutdown_hard_exit_worker,
+            args=(timeout_seconds,),
+            daemon=True,
+            name="gateway-shutdown-hard-exit",
+        )
+        watchdog.start()
+    except Exception:
+        with _shutdown_hard_exit_watchdog_lock:
+            _shutdown_hard_exit_watchdog_armed = False
+        logger.exception("Failed to arm gateway shutdown hard-exit watchdog")
+        return False
+    return True
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -4443,6 +4601,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text = getattr(event_or_text, "text", event_or_text) or ""
         return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
+    @staticmethod
+    def _should_evaluate_goal_after_result(
+        agent_result: Any,
+        final_text: str,
+    ) -> bool:
+        """Return whether a gateway result represents a judgeable goal turn.
+
+        Runtime continuation checkpoints intentionally carry a non-empty status
+        response, but no new model/tool work completed. Judging that status as
+        goal progress queues another synthetic continuation against the same
+        exhausted session and creates a tight loop until the goal turn budget
+        is consumed.
+        """
+        if not final_text.strip():
+            return False
+        return not (
+            isinstance(agent_result, dict)
+            and agent_result.get("continuation_required")
+        )
+
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session.
 
@@ -5967,6 +6145,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: Optional[str],
         agent: Any,
         executor_task: Optional[Any],
+        *,
+        final_delivery_confirmed: bool = False,
     ) -> bool:
         """Only emit the heartbeat while this task still owns the live run.
 
@@ -5976,6 +6156,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user sent ``/new`` and a fresh agent took the slot mid-run, #12029).
         """
         if agent is None:
+            return False
+        if final_delivery_confirmed:
             return False
         if executor_task is not None and executor_task.done():
             return False
@@ -8122,20 +8304,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running = False
             self._draining = True
 
-            # Notify all chats with active agents BEFORE draining.
-            # Adapters are still connected here, so messages can be sent.
-            await self._notify_active_sessions_of_shutdown()
-            logger.info(
-                "Shutdown phase: notify_active_sessions done at +%.2fs",
-                _phase_elapsed(),
-            )
-
-            timeout = self._restart_drain_timeout
-
-            # Pre-mark sessions as resume_pending BEFORE the drain wait.
-            # If the process is killed by the service manager during the
-            # drain, the durable marker is already written so the next
-            # gateway boot can recover in-flight sessions (#27856).
+            # Persist recovery intent before ANY optional shutdown await. In
+            # particular, chat notification delivery can stall on a dead
+            # transport; the hard-exit watchdog must never fire before active
+            # conversations are marked resumable.
             _pre_drain_keys: list[str] = []
             for _sk, _agent in list(self._running_agents.items()):
                 if _agent is _AGENT_PENDING_SENTINEL:
@@ -8148,6 +8320,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pre_drain_keys.append(_sk)
                 except Exception as _e:
                     logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
+
+            # Notify all chats with active agents BEFORE draining.
+            # Adapters are still connected here, so messages can be sent.
+            await self._notify_active_sessions_of_shutdown()
+            logger.info(
+                "Shutdown phase: notify_active_sessions done at +%.2fs",
+                _phase_elapsed(),
+            )
+
+            timeout = self._restart_drain_timeout
 
             _cron_at_start = self._active_cron_job_count()
             _drain_started_at = time.monotonic()
@@ -10290,10 +10472,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _final_text = str(_agent_result.get("final_response") or "")
                 elif isinstance(_agent_result, str):
                     _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
+                # Skip empty responses and internal continuation checkpoints.
+                # Neither represents completed goal progress; judging either
+                # would almost always enqueue another turn and loop on the
+                # same error/exhausted runtime state.
+                if self._should_evaluate_goal_after_result(
+                    _agent_result,
+                    _final_text,
+                ):
                     try:
                         session_entry = await self.async_session_store.get_or_create_session(source)
                     except Exception:
@@ -17976,7 +18162,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # read *and* reassign the outer `_run_agent` parameter without
             # triggering an UnboundLocalError on the earlier read at
             # `_resolve_turn_agent_config(message, …)`.
-            nonlocal message
+            nonlocal message, session_id
 
             # session_key is propagated via contextvars in _set_session_env()
             # (_SESSION_KEY) and via set_current_session_key() (_approval_session_key)
@@ -18928,7 +19114,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
                 _stream_consumer.finish()
-            
+
+            # A runtime checkpoint is an internal safety boundary, not a
+            # meaningful Telegram response.  In particular, the historical
+            # 90k lifetime-token guard could end a perfectly healthy chat and
+            # leave its routing key pointing at the ended transcript.  Rotate
+            # the gateway session immediately so the *next* inbound message
+            # starts cleanly; never expose the raw implementation string to a
+            # user.  The triggering turn cannot be replayed safely here: it
+            # may contain an interrupted tool sequence, whereas a fresh turn
+            # gives the user a deterministic, usable recovery path.
+            if (
+                result.get("continuation_required")
+                and result.get("continuation_reason") == "input_token_threshold"
+                and session_key
+            ):
+                logger.warning(
+                    "Rotating gateway session %s after input-token checkpoint",
+                    session_key,
+                )
+                try:
+                    new_entry = self.session_store.reset_session(session_key)
+                    self._evict_cached_agent(session_key)
+                    self._session_model_overrides.pop(session_key, None)
+                    self._set_session_reasoning_override(session_key, None)
+                    if new_entry is not None:
+                        session_id = new_entry.session_id
+                        self._sync_telegram_topic_binding(
+                            source,
+                            new_entry,
+                            reason="input-token-checkpoint-reset",
+                        )
+                    result["final_response"] = (
+                        "I reached a safe conversation boundary and opened a fresh "
+                        "session. Please send your last request again — I am ready."
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not rotate gateway session %s after input-token checkpoint",
+                        session_key,
+                    )
+
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
 
@@ -19337,13 +19563,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
 
-        # Periodic "still working" notifications for long-running tasks.
-        # Fires every N seconds so the user knows the agent hasn't died.
-        # Config: agent.gateway_notify_interval in config.yaml, or
-        # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
-        # 0 = disable notifications.
-        _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
-        _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        # Acknowledge a slow turn once, then periodically refresh the same
+        # status message so the user knows the request was received and what
+        # Hermes is currently doing. Config:
+        #   agent.gateway_notify_initial_delay (default 60s)
+        #   agent.gateway_notify_interval (default 300s)
+        # A non-positive repeat interval disables both notifications.
+        _NOTIFY_INITIAL_DELAY, _NOTIFY_INTERVAL = _long_running_notification_timing()
         _long_running_mode = _display_surface_mode(
             "long_running_notifications",
             default=True,
@@ -19354,7 +19580,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _notify_start = time.time()
 
         async def _notify_long_running():
-            if _NOTIFY_INTERVAL is None:
+            if _NOTIFY_INITIAL_DELAY is None or _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
             _notify_adapter = self._adapter_for_source(source)
             if not _notify_adapter:
@@ -19365,8 +19591,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # interval. Falls back to send-new when edit fails or isn't
             # supported by the adapter.
             _heartbeat_msg_id: Optional[str] = None
+            await asyncio.sleep(_NOTIFY_INITIAL_DELAY)
+            _first_notification = True
             while True:
-                await asyncio.sleep(_NOTIFY_INTERVAL)
                 # Stop heartbeating once this run no longer owns the session
                 # slot or the executor has finished — otherwise a stale
                 # "running: delegate_task" bubble can outlive the run that
@@ -19377,9 +19604,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _exec_ref = _executor_task
                 except NameError:
                     _exec_ref = None
-                if not self._should_emit_long_running_notification(
-                    session_key, agent_holder[0], _exec_ref
-                ):
+
+                def _notification_still_current() -> bool:
+                    return self._should_emit_long_running_notification(
+                        session_key,
+                        agent_holder[0],
+                        _exec_ref,
+                        final_delivery_confirmed=(
+                            _stream_final_delivery_confirmed(stream_consumer_holder)
+                        ),
+                    )
+
+                if not _notification_still_current():
                     break
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
                 # Include agent activity context if available. Default
@@ -19411,37 +19647,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = (
-                    _generic_status_phrase("status")
-                    if _long_running_mode == "generic"
-                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                if _long_running_mode == "generic":
+                    _heartbeat_text = _generic_status_phrase("status")
+                else:
+                    _heartbeat_text = _format_long_running_notification(
+                        first=_first_notification,
+                        elapsed_minutes=_elapsed_mins,
+                        status_detail=_status_detail,
+                        repeat_interval=_NOTIFY_INTERVAL,
+                    )
+                _previous_heartbeat_msg_id = _heartbeat_msg_id
+                _heartbeat_msg_id, _first_notification = (
+                    await _deliver_long_running_notification(
+                        adapter=_notify_adapter,
+                        chat_id=source.chat_id,
+                        text=_heartbeat_text,
+                        metadata=_non_conversational_metadata(
+                            _status_thread_metadata,
+                            platform=source.platform,
+                        ),
+                        heartbeat_message_id=_heartbeat_msg_id,
+                        first_notification=_first_notification,
+                        should_continue=_notification_still_current,
+                    )
                 )
-                try:
-                    _notify_res = None
-                    if _heartbeat_msg_id:
-                        try:
-                            _notify_res = await _notify_adapter.edit_message(
-                                source.chat_id,
-                                _heartbeat_msg_id,
-                                _heartbeat_text,
-                            )
-                        except Exception as _ee:
-                            logger.debug("Heartbeat edit failed: %s", _ee)
-                            _notify_res = None
-                    if not (_notify_res and getattr(_notify_res, "success", False)):
-                        _notify_res = await _notify_adapter.send(
-                            source.chat_id,
-                            _heartbeat_text,
-                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
-                        )
-                        if getattr(_notify_res, "success", False) and getattr(
-                            _notify_res, "message_id", None
-                        ):
-                            _heartbeat_msg_id = str(_notify_res.message_id)
-                            if _cleanup_progress:
-                                _cleanup_msg_ids.append(_heartbeat_msg_id)
-                except Exception as _ne:
-                    logger.debug("Long-running notification error: %s", _ne)
+                if (
+                    _cleanup_progress
+                    and _heartbeat_msg_id
+                    and _heartbeat_msg_id != _previous_heartbeat_msg_id
+                ):
+                    _cleanup_msg_ids.append(_heartbeat_msg_id)
+                await asyncio.sleep(_NOTIFY_INTERVAL)
 
         _notify_task = asyncio.create_task(_notify_long_running())
 
@@ -20598,6 +20834,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Set up signal handlers
     def shutdown_signal_handler(received_signal=None):
         nonlocal _signal_initiated_shutdown
+        _arm_shutdown_hard_exit_watchdog()
         # Planned --replace takeover check: when a sibling gateway is
         # taking over via --replace, it wrote a marker naming this PID
         # before sending SIGTERM. If present, treat the signal as a

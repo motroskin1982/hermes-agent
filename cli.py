@@ -884,6 +884,59 @@ def _sync_process_session_id(session_id: str) -> None:
 
     set_current_session_id(session_id)
 
+
+def _resolve_kanban_worker_launch_identity(env: dict[str, str] | os._Environ[str]) -> dict[str, str] | None:
+    """Validate the complete controller-issued identity before fixed-session use."""
+    worker_session_id = env.get("HERMES_KANBAN_WORKER_SESSION_ID")
+    if worker_session_id is None:
+        return None
+    required = {
+        "campaign_id": "HERMES_KANBAN_CAMPAIGN",
+        "assignment_id": "HERMES_CONTROLLER_ASSIGNMENT",
+        "board": "HERMES_KANBAN_BOARD",
+        "task_id": "HERMES_KANBAN_TASK",
+        "profile": "HERMES_PROFILE",
+        "run_id": "HERMES_KANBAN_RUN_ID",
+        "claim_lock": "HERMES_KANBAN_CLAIM_LOCK",
+        "launch_id": "HERMES_KANBAN_LAUNCH_ID",
+        "worker_session_id": "HERMES_KANBAN_WORKER_SESSION_ID",
+        "runtime_session_id": "HERMES_SESSION_ID",
+    }
+    missing = [key for key in required.values() if not str(env.get(key) or "").strip()]
+    if missing:
+        raise ValueError("incomplete kanban worker launch identity")
+    values = {name: str(env[key]) for name, key in required.items()}
+    if any(any(ch.isspace() for ch in value) for value in values.values()):
+        raise ValueError("invalid kanban worker launch identity")
+    if re.fullmatch(r"ks_[0-9a-f]{32}", values["worker_session_id"]) is None:
+        raise ValueError("invalid kanban worker session id")
+    if values["runtime_session_id"] != values["worker_session_id"]:
+        raise ValueError("kanban worker session id mismatch")
+    if not values["run_id"].isdigit():
+        raise ValueError("invalid kanban worker run id")
+    values.pop("runtime_session_id")
+    return values
+
+
+def _resolve_cli_session_identity(
+    *,
+    resume: str | None,
+    worker_session_id: str | None,
+    generated_session_id: str | None = None,
+) -> tuple[str, bool]:
+    """Resolve controller-issued Kanban sessions without allowing resume."""
+    if worker_session_id is not None:
+        if resume:
+            raise ValueError("kanban worker session cannot resume another session")
+        if re.fullmatch(r"ks_[0-9a-f]{32}", worker_session_id) is None:
+            raise ValueError("invalid kanban worker session id")
+        return worker_session_id, False
+    if resume:
+        return resume, True
+    if not generated_session_id:
+        raise ValueError("generated session id is required")
+    return generated_session_id, False
+
 # Cron job system for scheduled tasks (execution is handled by the gateway)
 def get_job(*args, **kwargs):
     from cron import get_job as _get_job
@@ -4019,14 +4072,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Deferred title: stored in memory until the session is created in the DB
         self._pending_title: Optional[str] = None
         
-        # Session ID: reuse existing one when resuming, otherwise generate fresh
-        if resume:
-            self.session_id = resume
-            self._resumed = True
-        else:
-            timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
-            short_uuid = uuid.uuid4().hex[:6]
-            self.session_id = f"{timestamp_str}_{short_uuid}"
+        # Session ID: controller-issued Kanban worker identities are always
+        # fresh and may never enter the resume path. Ordinary CLI behaviour is
+        # unchanged when HERMES_KANBAN_WORKER_SESSION_ID is absent.
+        timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
+        short_uuid = uuid.uuid4().hex[:6]
+        generated_session_id = f"{timestamp_str}_{short_uuid}"
+        self._kanban_worker_launch = _resolve_kanban_worker_launch_identity(os.environ)
+        self.session_id, self._resumed = _resolve_cli_session_identity(
+            resume=resume,
+            worker_session_id=(
+                self._kanban_worker_launch["worker_session_id"]
+                if self._kanban_worker_launch else None
+            ),
+            generated_session_id=generated_session_id,
+        )
         
         # History file for persistent input recall across sessions
         self._history_file = _hermes_home / ".hermes_history"
@@ -4154,13 +4214,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         try:
             from hermes_cli.active_sessions import try_acquire_active_session
 
+            worker_launch = getattr(self, "_kanban_worker_launch", None)
+            metadata = None
+            if worker_launch:
+                metadata = {
+                    "exclusive_session_id": True,
+                    "require_unique_session_id": True,
+                    **worker_launch,
+                }
             lease, message = try_acquire_active_session(
                 session_id=self.session_id,
-                surface=surface,
+                surface="kanban-worker" if worker_launch else surface,
                 config=self.config,
+                metadata=metadata,
             )
         except Exception as exc:
             logger.warning("Failed to claim active session slot: %s", exc)
+            if os.environ.get("HERMES_KANBAN_WORKER_SESSION_ID"):
+                if stderr:
+                    print("Kanban worker session registry unavailable; refusing launch.", file=sys.stderr)
+                else:
+                    self._console_print("[bold red]Kanban worker session registry unavailable; refusing launch.[/]")
+                return False
             return True
         if message:
             if stderr:
@@ -12119,6 +12194,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             request_overrides=turn_route.get("request_overrides"),
         ):
             return None
+        if getattr(self, "_kanban_worker_launch", None):
+            from hermes_cli.cli_agent_setup_mixin import _finalize_kanban_worker_agent_handshake
+            _finalize_kanban_worker_agent_handshake(self)
         
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
@@ -12374,6 +12452,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         "error": _summary,
                     }
                 finally:
+                    if (
+                        getattr(self, "_kanban_worker_launch", None)
+                        and getattr(self, "agent", None) is not None
+                    ):
+                        from hermes_cli.cli_agent_setup_mixin import _finalize_kanban_worker_agent_handshake
+                        _finalize_kanban_worker_agent_handshake(self)
                     # Surface any credit notices queued during the turn (cold-start
                     # seed / per-turn capture) now that the response is done — printing
                     # at this boundary paints cleanly above the prompt instead of being
@@ -16166,25 +16250,48 @@ def main(
                         # status lines).  The response is printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
-                        try:
-                            result = cli.agent.run_conversation(
-                                user_message=effective_query,
-                                conversation_history=cli.conversation_history,
-                            )
-                        except KeyboardInterrupt:
-                            _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
-                            print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
-                            sys.exit(130)
-                        # Sync session_id if mid-run compression created a
-                        # continuation session. The exit line below reports
-                        # session_id to stderr for automation wrappers; without
-                        # this sync it would point at the ended parent.
-                        if (
-                            getattr(cli.agent, "session_id", None)
-                            and cli.agent.session_id != cli.session_id
-                        ):
-                            cli.session_id = cli.agent.session_id
-                        response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        continuation_prompt = (
+                            "Continue this same Kanban task in the same session. "
+                            "Finish by calling kanban_complete or kanban_block."
+                        )
+                        while True:
+                            try:
+                                result = cli.agent.run_conversation(
+                                    user_message=effective_query,
+                                    conversation_history=cli.conversation_history,
+                                )
+                            except KeyboardInterrupt:
+                                _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
+                                print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                                sys.exit(130)
+                            # Sync session_id if mid-run compression created a
+                            # continuation session. The exit line below reports
+                            # session_id to stderr for automation wrappers; without
+                            # this sync it would point at the ended parent.
+                            if (
+                                getattr(cli.agent, "session_id", None)
+                                and cli.agent.session_id != cli.session_id
+                            ):
+                                cli.session_id = cli.agent.session_id
+                            response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                            if not (
+                                os.environ.get("HERMES_KANBAN_TASK")
+                                and isinstance(result, dict)
+                                and result.get("continuation_required")
+                            ):
+                                break
+                            if isinstance(result, dict) and result.get("messages"):
+                                cli.conversation_history = result["messages"]
+                            # ``continuation_required`` ends one bounded agent
+                            # turn after its cumulative-input safety limit.  The
+                            # next turn deliberately carries the transcript, but
+                            # it must start a fresh accounting window; otherwise
+                            # ``run_conversation`` sees the previous total at its
+                            # entry check and checkpoints again without making an
+                            # API call (a busy continuation loop for workers).
+                            cli.agent.session_input_tokens = 0
+                            cli.agent.session_api_calls = 0
+                            effective_query = continuation_prompt
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
                         # interactive CLI path. Write to stderr so piped stdout

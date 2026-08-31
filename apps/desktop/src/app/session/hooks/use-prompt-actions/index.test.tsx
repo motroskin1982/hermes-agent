@@ -1321,6 +1321,47 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(createBackendSessionForSend).toHaveBeenCalledTimes(1)
     expect(calls).not.toContain('session.resume')
   })
+
+  it('submits after new-chat creation intentionally selects and navigates to the new session', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
+    let routeToken = '/chat/new'
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+
+    const createBackendSessionForSend = vi.fn(async () => {
+      activeSessionIdRef.current = RUNTIME_SESSION_ID
+      selectedStoredSessionIdRef.current = 'stored-new-session'
+      routeToken = '/chat/stored-new-session'
+
+      return RUNTIME_SESSION_ID
+    })
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        getRouteToken={() => routeToken}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+
+    expect(await handle!.submitText('first real Desktop message')).toBe(true)
+    expect(calls).toContainEqual({
+      method: 'prompt.submit',
+      params: { session_id: RUNTIME_SESSION_ID, text: 'first real Desktop message' }
+    })
+  })
 })
 
 describe('usePromptActions submit session-context isolation (#54527)', () => {

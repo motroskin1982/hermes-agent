@@ -65,6 +65,12 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
+from agent.runtime_circuit_breaker import (
+    INPUT_TOKEN_CHECKPOINT_THRESHOLD,
+    SessionCircuitBreaker,
+    observe_tool_messages,
+    persist_runtime_checkpoint,
+)
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -619,6 +625,32 @@ def run_conversation(
     # recovery text produced by unrelated exit paths.
     _pending_verification_response = None
 
+    # Per-agent state prevents leakage between concurrent cron/interactive runs.
+    _runtime_breaker = getattr(agent, "_runtime_circuit_breaker", None)
+    if _runtime_breaker is None:
+        _runtime_breaker = SessionCircuitBreaker()
+        agent._runtime_circuit_breaker = _runtime_breaker
+
+    def _continuation_required(reason: str, details: dict[str, Any]) -> dict[str, Any]:
+        checkpoint = persist_runtime_checkpoint(agent, messages, reason, details)
+        agent._session_messages = messages
+        agent._persist_session(messages, conversation_history)
+        if agent._session_db and agent.session_id:
+            try:
+                agent._session_db.end_session(agent.session_id, reason)
+            except Exception as exc:
+                logger.warning("Could not mark continuation-required session ended: %s", exc)
+        return {
+            "final_response": "Session paused; continuation is required.",
+            "messages": messages,
+            "api_calls": api_call_count,
+            "completed": False,
+            "partial": True,
+            "continuation_required": True,
+            "continuation_reason": reason,
+            "checkpoint": checkpoint,
+        }
+
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
@@ -641,6 +673,15 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        # Never start another model/tool turn after the cumulative threshold.
+        if agent.session_input_tokens >= INPUT_TOKEN_CHECKPOINT_THRESHOLD:
+            return _continuation_required(
+                "input_token_threshold",
+                {
+                    "threshold": INPUT_TOKEN_CHECKPOINT_THRESHOLD,
+                    "observed_input_tokens": agent.session_input_tokens,
+                },
+            )
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
 
@@ -4712,7 +4753,16 @@ def run_conversation(
                     except Exception:
                         pass
 
+                _tool_message_start = len(messages)
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                _runtime_trip = observe_tool_messages(
+                    _runtime_breaker, messages, _tool_message_start
+                )
+                if _runtime_trip:
+                    return _continuation_required(
+                        "runtime_circuit_breaker", _runtime_trip
+                    )
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

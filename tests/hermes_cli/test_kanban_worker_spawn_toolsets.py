@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 
 
@@ -58,6 +59,8 @@ agent:
     )
     root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
+    worker_session_id = "ks_" + "e" * 32
+    monkeypatch.delenv("HERMES_KANBAN_WORKER_SESSION_ID", raising=False)
 
     from hermes_cli import kanban_db as kb
 
@@ -78,11 +81,19 @@ agent:
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    pid = kb._default_spawn(
+        _make_task(kb, assignee="elias"), str(workspace),
+        extra_env={"HERMES_KANBAN_WORKER_SESSION_ID": worker_session_id},
+    )
 
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert captured["env"]["HERMES_KANBAN_WORKER_SESSION_ID"] == worker_session_id
+    assert "HERMES_KANBAN_WORKER_SESSION_ID" not in os.environ
+    # Dispatcher workers must take cli.main's machine-worker path so a
+    # deliberate continuation_required checkpoint stays in-process.
+    assert "--quiet" in captured["cmd"]
     assert "--toolsets" in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
