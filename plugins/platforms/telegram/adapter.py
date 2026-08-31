@@ -162,11 +162,17 @@ try:
         Application,
         CommandHandler,
         CallbackQueryHandler,
-        ChatJoinRequestHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
         filters,
     )
+    try:
+        # Optional: only the join-request observer needs it. Importing it in the
+        # block above would mean an older python-telegram-bot silently disabled
+        # the ENTIRE Telegram adapter rather than just this one feature.
+        from telegram.ext import ChatJoinRequestHandler
+    except ImportError:
+        ChatJoinRequestHandler = None
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
     TELEGRAM_AVAILABLE = True
@@ -3279,7 +3285,15 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
-            self._app.add_handler(ChatJoinRequestHandler(self._handle_chat_join_request))
+            if ChatJoinRequestHandler is not None:
+                # Registered here, inside connect(), so it is installed on the
+                # first connection and on every reconnect alike.
+                self._app.add_handler(ChatJoinRequestHandler(self._handle_chat_join_request))
+            else:
+                logger.warning(
+                    "[Telegram] ChatJoinRequestHandler unavailable in this "
+                    "python-telegram-bot build; join-request admission is disabled."
+                )
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
