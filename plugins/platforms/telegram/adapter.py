@@ -227,6 +227,7 @@ try:
         CommandHandler,
         CallbackQueryHandler,
         ChatJoinRequestHandler,
+        PollAnswerHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
         filters,
@@ -246,6 +247,7 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     ChatJoinRequestHandler = Any
+    PollAnswerHandler = Any
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -3793,6 +3795,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
             self._app.add_handler(ChatJoinRequestHandler(self._handle_chat_join_request))
+            self._app.add_handler(PollAnswerHandler(self._handle_poll_answer))
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -3925,6 +3928,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         ))
                         self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
                         self._app.add_handler(ChatJoinRequestHandler(self._handle_chat_join_request))
+                        self._app.add_handler(PollAnswerHandler(self._handle_poll_answer))
                         # Best-effort discard the old app's resources
                         try:
                             await _shutdown_abandoned_app(old_app)
@@ -8683,6 +8687,40 @@ class TelegramAdapter(BasePlatformAdapter):
                 "chat_id": str(chat.id),
                 "user_id": str(user.id),
                 "private_chat_id": str(private_chat_id),
+                "update_id": int(getattr(update, "update_id", 0) or 0),
+            },
+        )
+
+    async def _handle_poll_answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Emit only allowlisted poll-answer identifiers to observer plugins.
+
+        Same contract as _handle_chat_join_request: identifiers, never content.
+        A poll answer carries the voter's first name and username; neither is
+        emitted, because an observer that wants a name already has the member
+        record and one that does not should not learn it here.
+
+        A retracted vote arrives as an empty option list and is passed through
+        as such, so an observer can remove the vote rather than keep a stale one.
+        """
+        del context
+        answer = getattr(update, "poll_answer", None)
+        user = getattr(answer, "user", None)
+        poll_id = getattr(answer, "poll_id", None)
+        if answer is None or user is None or not poll_id:
+            return
+        raw_options = getattr(answer, "option_ids", None) or []
+        try:
+            option_ids = [int(option) for option in raw_options]
+        except (TypeError, ValueError):
+            return
+        self.emit_plugin_event(
+            "poll_answer",
+            {
+                "schema_version": 1,
+                "poll_id": str(poll_id),
+                "user_id": str(user.id),
+                "option_ids": option_ids,
+                "retracted": not option_ids,
                 "update_id": int(getattr(update, "update_id", 0) or 0),
             },
         )
