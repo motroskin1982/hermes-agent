@@ -7241,8 +7241,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.warning("No adapter available for %s", _pval)
                 continue
             
-            # Set up message + fatal error handlers
-            adapter.set_message_handler(self._handle_message)
+            # Set up message + fatal error handlers.
+            #
+            # Stamp the ACTIVE profile too, not only secondary multiplexed ones.
+            # Without this a single-profile gateway persisted profile_name=NULL
+            # on every session, and a profile-scoped plugin that (correctly)
+            # treats an unstamped session as an unverified actor then refuses
+            # every tool call from it. Live effect in the Nova Teen Club:
+            # the bot could hold a conversation with a child and could not
+            # store a name, admit anyone, hand out the group link or notify its
+            # owner -- for weeks, looking like a dozen unrelated bugs.
+            adapter.set_message_handler(
+                self._make_profile_message_handler(self._active_profile_name()))
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -8078,7 +8088,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
-                    adapter.set_message_handler(self._handle_message)
+                    # Reconnect must stamp too, or a transient network drop
+                    # silently reverts the gateway to unstamped sessions.
+                    adapter.set_message_handler(
+                        self._make_profile_message_handler(self._active_profile_name()))
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)

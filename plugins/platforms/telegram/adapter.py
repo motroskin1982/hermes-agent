@@ -170,9 +170,10 @@ try:
         # Optional: only the join-request observer needs it. Importing it in the
         # block above would mean an older python-telegram-bot silently disabled
         # the ENTIRE Telegram adapter rather than just this one feature.
-        from telegram.ext import ChatJoinRequestHandler
+        from telegram.ext import ChatJoinRequestHandler, PollAnswerHandler
     except ImportError:
         ChatJoinRequestHandler = None
+        PollAnswerHandler = None
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
     TELEGRAM_AVAILABLE = True
@@ -188,6 +189,7 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     ChatJoinRequestHandler = Any
+    PollAnswerHandler = Any
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -3293,6 +3295,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning(
                     "[Telegram] ChatJoinRequestHandler unavailable in this "
                     "python-telegram-bot build; join-request admission is disabled."
+                )
+            if PollAnswerHandler is not None:
+                self._app.add_handler(PollAnswerHandler(self._handle_poll_answer))
+            else:
+                logger.warning(
+                    "[Telegram] PollAnswerHandler unavailable in this "
+                    "python-telegram-bot build; poll results will not be counted."
                 )
             
             # Start polling — retry initialize() for transient TLS resets.
@@ -7735,6 +7744,43 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
+
+    async def _handle_poll_answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Emit only allowlisted poll-answer identifiers to observer plugins.
+
+        Telegram already delivers these (the adapter subscribes to all update
+        types) and nothing consumed them, so a bot could post a poll to a group
+        and never learn the result.
+
+        Same contract as the join-request observer: identifiers, never content.
+        A poll answer carries the voter's first name and username; neither is
+        emitted, because an observer that wants a name already has its own
+        member record and one that does not should not learn it here.
+
+        A retracted vote arrives as an empty option list and is passed through
+        as a retraction, so an observer can drop a vote nobody stands behind.
+        """
+        del context
+        answer = getattr(update, "poll_answer", None)
+        user = getattr(answer, "user", None)
+        poll_id = getattr(answer, "poll_id", None)
+        if answer is None or user is None or not poll_id:
+            return
+        try:
+            option_ids = [int(option) for option in (getattr(answer, "option_ids", None) or [])]
+        except (TypeError, ValueError):
+            return
+        self.emit_plugin_event(
+            "poll_answer",
+            {
+                "schema_version": 1,
+                "poll_id": str(poll_id),
+                "user_id": str(user.id),
+                "option_ids": option_ids,
+                "retracted": not option_ids,
+                "update_id": int(getattr(update, "update_id", 0) or 0),
+            },
+        )
 
     async def _handle_chat_join_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Emit only allowlisted join-request identifiers to observer plugins."""
