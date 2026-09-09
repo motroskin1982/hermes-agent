@@ -170,10 +170,11 @@ try:
         # Optional: only the join-request observer needs it. Importing it in the
         # block above would mean an older python-telegram-bot silently disabled
         # the ENTIRE Telegram adapter rather than just this one feature.
-        from telegram.ext import ChatJoinRequestHandler, PollAnswerHandler
+        from telegram.ext import ChatJoinRequestHandler, PollAnswerHandler, ChatMemberHandler
     except ImportError:
         ChatJoinRequestHandler = None
         PollAnswerHandler = None
+        ChatMemberHandler = None
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
     TELEGRAM_AVAILABLE = True
@@ -190,6 +191,7 @@ except ImportError:
     CallbackQueryHandler = Any
     ChatJoinRequestHandler = Any
     PollAnswerHandler = Any
+    ChatMemberHandler = Any
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -263,6 +265,7 @@ def check_telegram_requirements() -> bool:
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
+    global ChatJoinRequestHandler, PollAnswerHandler, ChatMemberHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
         return True
@@ -282,6 +285,9 @@ def check_telegram_requirements() -> bool:
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
             MessageHandler as _MH,
+            ChatJoinRequestHandler as _CJRH,
+            PollAnswerHandler as _PAH,
+            ChatMemberHandler as _CMH,
             ContextTypes as _CT, filters as _filters,
         )
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
@@ -298,6 +304,9 @@ def check_telegram_requirements() -> bool:
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
     TelegramMessageHandler = _MH
+    ChatJoinRequestHandler = _CJRH
+    PollAnswerHandler = _PAH
+    ChatMemberHandler = _CMH
     ContextTypes = _CT
     filters = _filters
     ParseMode = _PM
@@ -3302,6 +3311,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning(
                     "[Telegram] PollAnswerHandler unavailable in this "
                     "python-telegram-bot build; poll results will not be counted."
+                )
+            if ChatMemberHandler is not None:
+                self._app.add_handler(
+                    ChatMemberHandler(self._handle_chat_member, ChatMemberHandler.CHAT_MEMBER)
+                )
+            else:
+                logger.warning(
+                    "[Telegram] ChatMemberHandler unavailable in this "
+                    "python-telegram-bot build; verified member-entry events are disabled."
                 )
             
             # Start polling — retry initialize() for transient TLS resets.
@@ -7799,6 +7817,45 @@ class TelegramAdapter(BasePlatformAdapter):
                 "user_id": str(user.id),
                 "private_chat_id": str(private_chat_id),
                 "update_id": int(getattr(update, "update_id", 0) or 0),
+            },
+        )
+
+    async def _handle_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Emit a minimal actual-membership transition to observer plugins.
+
+        A join request says only that someone is waiting. This event is emitted
+        by Telegram only after the group membership state changes. No display
+        name, username, bio, invite-link or raw Update crosses the plugin
+        boundary.
+        """
+        del context
+        change = getattr(update, "chat_member", None)
+        chat = getattr(change, "chat", None)
+        old = getattr(change, "old_chat_member", None)
+        new = getattr(change, "new_chat_member", None)
+        user = getattr(new, "user", None) or getattr(old, "user", None)
+        old_status = getattr(old, "status", None)
+        new_status = getattr(new, "status", None)
+        if chat is None or user is None or old_status is None or new_status is None:
+            return
+        def _is_member(member, status: str) -> bool:
+            if status == "restricted":
+                return bool(getattr(member, "is_member", False))
+            return status in {"member", "administrator", "creator", "owner"}
+
+        old_is_member = _is_member(old, str(old_status))
+        new_is_member = _is_member(new, str(new_status))
+        self.emit_plugin_event(
+            "chat_member",
+            {
+                "schema_version": 1,
+                "update_id": int(getattr(update, "update_id", 0) or 0),
+                "chat_id": str(chat.id),
+                "user_id": str(user.id),
+                "old_status": str(old_status),
+                "new_status": str(new_status),
+                "old_is_member": old_is_member,
+                "new_is_member": new_is_member,
             },
         )
 
