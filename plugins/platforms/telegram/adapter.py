@@ -3198,6 +3198,20 @@ class TelegramAdapter(BasePlatformAdapter):
                     and asyncio.get_running_loop().time() >= _bootstrap_deadline
                 )
 
+            async def _bootstrap_retry_backoff(wait: float) -> None:
+                """Sleep only inside the whole-connect deadline.
+
+                A fast OSError followed by the normal 1/2/4/... retry ladder
+                must not consume GatewayRunner's full outer timeout.  Once
+                the shared budget is spent, surface a retryable startup error
+                so the supervisor can construct a fresh adapter.
+                """
+                if _bootstrap_expired():
+                    raise OSError("Telegram initialization reached its bootstrap deadline")
+                await asyncio.sleep(min(wait, _bootstrap_timeout(wait)))
+                if _bootstrap_expired():
+                    raise OSError("Telegram initialization reached its bootstrap deadline")
+
             request_kwargs = {
                 "connection_pool_size": _env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
                 "pool_timeout": _env_float("HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", 8.0),
@@ -3401,7 +3415,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "[%s] Connect attempt %d/%d timed out after %.0fs — retrying in %ds",
                             self.name, _attempt + 1, _max_connect, _init_timeout, wait,
                         )
-                        await asyncio.sleep(wait)
+                        await _bootstrap_retry_backoff(wait)
                     else:
                         raise OSError(
                             f"Telegram initialization timed out after {_max_connect} attempts "
@@ -3415,7 +3429,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "[%s] Connect attempt %d/%d failed: %s — retrying in %ds",
                             self.name, _attempt + 1, _max_connect, init_err, wait,
                         )
-                        await asyncio.sleep(wait)
+                        await _bootstrap_retry_backoff(wait)
                     else:
                         raise
                 except Exception as init_err:
@@ -3427,7 +3441,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "[%s] Connect attempt %d/%d failed: %s — retrying in %ds",
                             self.name, _attempt + 1, _max_connect, init_err, wait,
                         )
-                        await asyncio.sleep(wait)
+                        await _bootstrap_retry_backoff(wait)
                     else:
                         raise
             logger.warning("[Telegram] bootstrap phase=app_start_begin")

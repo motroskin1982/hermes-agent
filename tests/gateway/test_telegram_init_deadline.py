@@ -156,6 +156,41 @@ async def test_connect_returns_before_outer_deadline_when_initialize_ignores_can
 
 
 @pytest.mark.asyncio
+async def test_connect_does_not_sleep_past_outer_deadline_after_fast_init_error(monkeypatch):
+    """Retry backoff is part of the whole-connect budget too."""
+    import asyncio as _asyncio
+    import time as _time
+
+    fake_app = MagicMock()
+    fake_app.bot = MagicMock()
+    fake_app.initialize = AsyncMock(side_effect=OSError("fast network failure"))
+    fake_app.add_handler = MagicMock()
+
+    chainable = MagicMock()
+    chainable.token.return_value = chainable
+    chainable.request.return_value = chainable
+    chainable.get_updates_request.return_value = chainable
+    chainable.build.return_value = fake_app
+    builder_root = MagicMock()
+    builder_root.builder.return_value = chainable
+
+    monkeypatch.setattr(tg_adapter, "Application", builder_root)
+    monkeypatch.setattr(tg_adapter, "HTTPXRequest", MagicMock)
+    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", AsyncMock(return_value=[]))
+    monkeypatch.setattr(tg_adapter, "resolve_proxy_url", lambda *a, **k: None)
+    monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "0.3")
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
+    monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+
+    started = _time.monotonic()
+    assert await _asyncio.wait_for(adapter.connect(), timeout=0.3) is False
+    assert _time.monotonic() - started < 0.3
+    assert fake_app.initialize.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_connect_returns_before_outer_deadline_when_polling_ignores_cancel(monkeypatch):
     """A wedged first getUpdates start must fail before GatewayRunner does."""
     import asyncio as _asyncio
