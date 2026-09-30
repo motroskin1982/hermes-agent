@@ -53,10 +53,12 @@ async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch
     monkeypatch.setattr(tg_adapter.asyncio, "sleep", AsyncMock())
 
     deadline_calls = 0
+    deadline_timeouts = []
 
     async def _fake_deadline(awaitable, timeout, *, on_abandon=None):
         nonlocal deadline_calls
         deadline_calls += 1
+        deadline_timeouts.append(timeout)
         if deadline_calls == 1:
             awaitable.close()
             raise tg_adapter.asyncio.TimeoutError()
@@ -76,7 +78,10 @@ async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch
 
     assert fake_app.initialize.call_count == 2
     assert fake_app.initialize.await_count == 1
-    assert deadline_calls == 2
+    assert deadline_calls == 3
+    # The adapter leaves five seconds for GatewayRunner to classify and tear
+    # down a stalled connection instead of racing its outer 30-second limit.
+    assert all(timeout < 30.0 for timeout in deadline_timeouts)
     tg_adapter.asyncio.sleep.assert_awaited_once_with(1)
     fake_app.start.assert_awaited_once()
     phases = [record.getMessage() for record in caplog.records if "bootstrap phase=" in record.getMessage()]
