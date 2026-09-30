@@ -3333,6 +3333,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "[%s] Connecting to Telegram (attempt %d/%d)…",
                         self.name, _attempt + 1, _max_connect,
                     )
+                    logger.warning("[Telegram] bootstrap phase=app_initialize_begin")
                     await _await_with_thread_deadline(
                         self._app.initialize(),
                         timeout=_init_timeout,
@@ -3344,6 +3345,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         # timeout pattern in agent/auxiliary_client.py).
                         on_abandon=lambda app=self._app: _shutdown_abandoned_app(app),
                     )
+                    logger.warning("[Telegram] bootstrap phase=app_initialized")
                     break
                 except asyncio.TimeoutError:
                     if _attempt < _max_connect - 1:
@@ -3381,7 +3383,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         await asyncio.sleep(wait)
                     else:
                         raise
+            logger.warning("[Telegram] bootstrap phase=app_start_begin")
             await self._app.start()
+            logger.warning("[Telegram] bootstrap phase=app_started")
 
             # Decide between webhook and polling mode
             # Webhook routing credentials are profile secrets.  Resolve via
@@ -3445,7 +3449,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 # updates. Best-effort: a transient Bot API network error here
                 # must not fail gateway startup — degrade to background polling
                 # recovery instead.
-                await self._delete_webhook_best_effort()
+                logger.warning("[Telegram] bootstrap phase=webhook_clear_begin")
+                webhook_cleared = await self._delete_webhook_best_effort()
+                logger.warning(
+                    "[Telegram] bootstrap phase=webhook_clear_done result=%s",
+                    "ok" if webhook_cleared else "degraded",
+                )
 
                 loop = asyncio.get_running_loop()
 
@@ -3475,12 +3484,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Store reference for retry use in _handle_polling_conflict
                 self._polling_error_callback_ref = _polling_error_callback
 
+                logger.warning("[Telegram] bootstrap phase=polling_start_begin")
                 polling_started = await self._start_polling_resilient(
                     # On a cold first boot drop the stale Bot API queue; on a
                     # watcher reconnect after an outage preserve it so messages
                     # sent while the bot was offline are delivered (#46621).
                     drop_pending_updates=not is_reconnect,
                     error_callback=_polling_error_callback,
+                )
+                logger.warning(
+                    "[Telegram] bootstrap phase=polling_start_done result=%s",
+                    "ok" if polling_started else "degraded",
                 )
                 if not polling_started:
                     logger.warning(

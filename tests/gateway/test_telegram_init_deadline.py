@@ -30,7 +30,7 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
 @pytest.mark.asyncio
-async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch):
+async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch, caplog):
     """A wedged initialize() attempt must not trap startup on attempt 1/8."""
     fake_app = MagicMock()
     fake_app.bot = MagicMock()
@@ -79,6 +79,19 @@ async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch
     assert deadline_calls == 2
     tg_adapter.asyncio.sleep.assert_awaited_once_with(1)
     fake_app.start.assert_awaited_once()
+    phases = [record.getMessage() for record in caplog.records if "bootstrap phase=" in record.getMessage()]
+    assert phases == [
+        "[Telegram] bootstrap phase=app_initialize_begin",
+        "[Telegram] bootstrap phase=app_initialize_begin",
+        "[Telegram] bootstrap phase=app_initialized",
+        "[Telegram] bootstrap phase=app_start_begin",
+        "[Telegram] bootstrap phase=app_started",
+        "[Telegram] bootstrap phase=webhook_clear_begin",
+        "[Telegram] bootstrap phase=webhook_clear_done result=ok",
+        "[Telegram] bootstrap phase=polling_start_begin",
+        "[Telegram] bootstrap phase=polling_start_done result=ok",
+    ]
+    assert "test-token" not in "\n".join(phases)
 
 
 @pytest.mark.asyncio
