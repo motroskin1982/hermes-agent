@@ -8,9 +8,11 @@ httpx connection pool — it neither returns nor raises. Unbounded, that wedges:
 2. the heartbeat loop (sees the recovery task as alive-but-wedged and skips),
 3. the fatal-error escalation (never reached).
 
-The fix wraps every ``start_polling()`` await in ``asyncio.wait_for`` with
-``_UPDATER_START_TIMEOUT`` so a hung call raises and feeds the existing retry
-ladder. These tests patch the timeout down to keep the suite fast.
+The initial bootstrap uses a detached deadline rather than
+``asyncio.wait_for``: PTB can absorb cancellation, causing ``wait_for`` to
+wait past the gateway's own outer deadline. A timed-out initial bootstrap
+therefore fails retryably so the supervisor creates a fresh adapter. The
+steady-state reconnect ladder retains its bounded retry behavior.
 """
 import asyncio
 import sys
@@ -93,10 +95,8 @@ async def test_network_ladder_start_polling_hang_does_not_wedge(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_start_polling_hang_schedules_recovery(monkeypatch):
-    """_start_polling_resilient: a hung bootstrap start_polling() must raise
-    TimeoutError (an OSError → classified as network error) and schedule
-    background recovery instead of blocking connect() forever."""
+async def test_bootstrap_start_polling_hang_fails_for_fresh_adapter_retry(monkeypatch):
+    """A wedged first poll must not leave a live degraded adapter behind."""
     monkeypatch.setattr(tg_adapter, "_UPDATER_START_TIMEOUT", 0.2)
     a = _bare_adapter()
 
@@ -105,20 +105,11 @@ async def test_bootstrap_start_polling_hang_schedules_recovery(monkeypatch):
     app.updater.start_polling = _hang_forever
     a._app = app
 
-    scheduled = []
-    monkeypatch.setattr(
-        a, "_schedule_polling_recovery",
-        lambda err, reason: scheduled.append((err, reason)),
-        raising=False,
-    )
-
-    ok = await asyncio.wait_for(
-        a._start_polling_resilient(drop_pending_updates=False, error_callback=None),
-        timeout=10,
-    )
-    assert ok is False
-    assert len(scheduled) == 1
-    assert isinstance(scheduled[0][0], (TimeoutError, asyncio.TimeoutError))
+    with pytest.raises(OSError, match="polling bootstrap timed out"):
+        await asyncio.wait_for(
+            a._start_polling_resilient(drop_pending_updates=False, error_callback=None),
+            timeout=10,
+        )
 
 
 @pytest.mark.asyncio
@@ -137,21 +128,25 @@ async def test_start_polling_success_path_unaffected(monkeypatch):
     app.updater.start_polling.assert_awaited_once()
 
 
-def test_every_start_polling_call_site_is_time_bounded():
+def test_every_start_polling_call_site_uses_detached_deadline():
     """Bug-class contract: every `updater.start_polling(` await in the adapter
-    must be wrapped in asyncio.wait_for. A new unbounded call site reintroduces
+    must be time-bounded. Bootstrap uses _await_with_thread_deadline while
+    background recovery uses asyncio.wait_for outside the runner envelope. A new unbounded call site reintroduces
     the #59614 wedge."""
     import inspect
     import re
 
     src = inspect.getsource(tg_adapter)
-    # Find each start_polling( call and check an enclosing wait_for within the
+    # Find each start_polling( call and check an enclosing detached deadline within the
     # preceding 6 lines (the wrapper always sits directly above).
     lines = src.splitlines()
     unbounded = []
     for i, line in enumerate(lines):
         if re.search(r"updater\.start_polling\(", line) and "def " not in line:
             window = "\n".join(lines[max(0, i - 6):i + 1])
-            if "wait_for" not in window:
+            if (
+                "_await_with_thread_deadline" not in window
+                and "asyncio.wait_for" not in window
+            ):
                 unbounded.append((i + 1, line.strip()))
     assert not unbounded, f"unbounded start_polling() call sites: {unbounded}"

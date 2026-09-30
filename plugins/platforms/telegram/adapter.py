@@ -2101,21 +2101,22 @@ class TelegramAdapter(BasePlatformAdapter):
         if not (self._app and self._app.updater):
             raise RuntimeError("Telegram application/updater not initialized")
         try:
-            # Same watchdog bound as the reconnect ladders: a wedged httpx
-            # connection pool can hang start_polling() forever at bootstrap
-            # too (#59614). A propagating TimeoutError is a builtins
-            # TimeoutError (OSError subclass), so the except below classifies
-            # it via _looks_like_network_error and schedules background
-            # recovery instead of blocking connect() indefinitely.
-            await asyncio.wait_for(
+            # PTB/httpcore can absorb cancellation, so asyncio.wait_for()
+            # can itself wait past GatewayRunner's outer deadline. This
+            # detached deadline returns promptly; connect() then fails
+            # retryably and the supervisor creates a fresh adapter.
+            await _await_with_thread_deadline(
                 self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=drop_pending_updates,
                     error_callback=error_callback,
                 ),
                 timeout=_UPDATER_START_TIMEOUT if timeout is None else max(0.1, timeout),
+                on_abandon=lambda app=self._app: _shutdown_abandoned_app(app),
             )
             return True
+        except asyncio.TimeoutError as exc:
+            raise OSError("Telegram polling bootstrap timed out") from exc
         except Exception as err:
             if self._looks_like_polling_conflict(err):
                 logger.warning(
@@ -3170,6 +3171,33 @@ class TelegramAdapter(BasePlatformAdapter):
                 except (TypeError, ValueError):
                     return default
 
+            # Start this deadline before any awaited bootstrap work, including
+            # DNS-over-HTTPS fallback discovery. This preserves time for the
+            # outer gateway supervisor to classify and retry a stalled call.
+            _gateway_connect_timeout = _env_float(
+                "HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", 30.0
+            )
+            _bootstrap_deadline = None
+            if _gateway_connect_timeout > 0:
+                _bootstrap_deadline = (
+                    asyncio.get_running_loop().time()
+                    + max(0.1, _gateway_connect_timeout - _GATEWAY_CONNECT_HEADROOM)
+                )
+
+            def _bootstrap_timeout(default: float) -> float:
+                if _bootstrap_deadline is None:
+                    return max(0.1, default)
+                return max(
+                    0.1,
+                    min(default, _bootstrap_deadline - asyncio.get_running_loop().time()),
+                )
+
+            def _bootstrap_expired() -> bool:
+                return (
+                    _bootstrap_deadline is not None
+                    and asyncio.get_running_loop().time() >= _bootstrap_deadline
+                )
+
             request_kwargs = {
                 "connection_pool_size": _env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
                 "pool_timeout": _env_float("HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", 8.0),
@@ -3222,7 +3250,13 @@ class TelegramAdapter(BasePlatformAdapter):
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
                 logger.warning("[%s] Discovering Telegram API fallback IPs via DNS-over-HTTPS…", self.name)
-                fallback_ips = await discover_fallback_ips()
+                try:
+                    fallback_ips = await _await_with_thread_deadline(
+                        discover_fallback_ips(),
+                        timeout=_bootstrap_timeout(_UPDATER_START_TIMEOUT),
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise OSError("Telegram fallback discovery timed out") from exc
                 logger.info(
                     "[%s] Auto-discovered Telegram fallback IPs: %s",
                     self.name,
@@ -3335,34 +3369,6 @@ class TelegramAdapter(BasePlatformAdapter):
             # fallback-IP chain can't block startup indefinitely.
             _max_connect = 8
             _init_timeout = _env_float("HERMES_TELEGRAM_INIT_TIMEOUT", 30.0)
-            # GatewayRunner also bounds the whole adapter connection.  Keep
-            # all blocking bootstrap phases inside that envelope with a small
-            # teardown/classification margin.  Otherwise its outer
-            # ``wait_for`` can cancel us at exactly the same instant that the
-            # inner deadline would turn a wedge into a retryable error.
-            _gateway_connect_timeout = _env_float(
-                "HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", 30.0
-            )
-            _bootstrap_deadline = None
-            if _gateway_connect_timeout > 0:
-                _bootstrap_deadline = (
-                    asyncio.get_running_loop().time()
-                    + max(0.1, _gateway_connect_timeout - _GATEWAY_CONNECT_HEADROOM)
-                )
-
-            def _bootstrap_timeout(default: float) -> float:
-                if _bootstrap_deadline is None:
-                    return max(0.1, default)
-                return max(
-                    0.1,
-                    min(default, _bootstrap_deadline - asyncio.get_running_loop().time()),
-                )
-
-            def _bootstrap_expired() -> bool:
-                return (
-                    _bootstrap_deadline is not None
-                    and asyncio.get_running_loop().time() >= _bootstrap_deadline
-                )
 
             for _attempt in range(_max_connect):
                 try:
@@ -3425,7 +3431,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     else:
                         raise
             logger.warning("[Telegram] bootstrap phase=app_start_begin")
-            await self._app.start()
+            try:
+                await _await_with_thread_deadline(
+                    self._app.start(),
+                    timeout=_bootstrap_timeout(_UPDATER_START_TIMEOUT),
+                    on_abandon=lambda app=self._app: _shutdown_abandoned_app(app),
+                )
+            except asyncio.TimeoutError as exc:
+                raise OSError("Telegram application start timed out") from exc
             logger.warning("[Telegram] bootstrap phase=app_started")
 
             # Decide between webhook and polling mode
@@ -3465,19 +3478,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 from urllib.parse import urlparse
                 webhook_path = urlparse(webhook_url).path or "/telegram"
 
-                await self._app.updater.start_webhook(
-                    listen="0.0.0.0",
-                    port=webhook_port,
-                    url_path=webhook_path,
-                    webhook_url=webhook_url,
-                    secret_token=webhook_secret,
-                    allowed_updates=Update.ALL_TYPES,
-                    # Webhooks are push-based — Telegram does not hold a
-                    # server-side getUpdates queue, so this flag is a no-op
-                    # in practice. Mirror the polling path's reconnect
-                    # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
-                )
+                try:
+                    await _await_with_thread_deadline(
+                        self._app.updater.start_webhook(
+                            listen="0.0.0.0",
+                            port=webhook_port,
+                            url_path=webhook_path,
+                            webhook_url=webhook_url,
+                            secret_token=webhook_secret,
+                            allowed_updates=Update.ALL_TYPES,
+                            drop_pending_updates=not is_reconnect,
+                        ),
+                        timeout=_bootstrap_timeout(_UPDATER_START_TIMEOUT),
+                        on_abandon=lambda app=self._app: _shutdown_abandoned_app(app),
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise OSError("Telegram webhook bootstrap timed out") from exc
                 self._webhook_mode = True
                 logger.info(
                     "[%s] Webhook server listening on 0.0.0.0:%d%s",
@@ -3495,13 +3511,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     webhook_cleared = await _await_with_thread_deadline(
                         self._delete_webhook_best_effort(),
                         timeout=_bootstrap_timeout(_UPDATER_START_TIMEOUT),
+                        on_abandon=lambda app=self._app: _shutdown_abandoned_app(app),
                     )
-                except asyncio.TimeoutError:
-                    webhook_cleared = False
-                    self._send_path_degraded = True
-                    logger.warning(
-                        "[Telegram] bootstrap phase=webhook_clear_done result=degraded"
-                    )
+                except asyncio.TimeoutError as exc:
+                    # A normal deleteWebhook network error remains
+                    # best-effort. A cancellation-resistant call leaves a
+                    # poisoned app alive, so retry with a fresh adapter.
+                    raise OSError("Telegram webhook clear timed out") from exc
                 else:
                     logger.warning(
                         "[Telegram] bootstrap phase=webhook_clear_done result=%s",
