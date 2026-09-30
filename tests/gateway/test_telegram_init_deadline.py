@@ -100,6 +100,60 @@ async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_connect_returns_before_outer_deadline_when_initialize_ignores_cancel(monkeypatch):
+    """The adapter owns a shorter deadline than GatewayRunner's outer bound.
+
+    PTB/httpcore can enter cancellation-shielded scopes.  If a hanging
+    initialize() only sees cancellation after the outer gateway timeout, the
+    runner never reaches its retry/error path.  A very short synthetic outer
+    budget makes this race deterministic without a 30-second test.
+    """
+    import asyncio as _asyncio
+    import time as _time
+
+    fake_app = MagicMock()
+    release = _asyncio.Event()
+
+    async def _cancel_resistant_initialize():
+        try:
+            await _asyncio.Future()
+        except _asyncio.CancelledError:
+            await release.wait()
+
+    fake_app.initialize = _cancel_resistant_initialize
+    fake_app.start = AsyncMock()
+    fake_app.add_handler = MagicMock()
+    fake_app.bot = MagicMock()
+
+    chainable = MagicMock()
+    chainable.token.return_value = chainable
+    chainable.request.return_value = chainable
+    chainable.get_updates_request.return_value = chainable
+    chainable.build.return_value = fake_app
+    builder_root = MagicMock()
+    builder_root.builder.return_value = chainable
+
+    monkeypatch.setattr(tg_adapter, "Application", builder_root)
+    monkeypatch.setattr(tg_adapter, "HTTPXRequest", MagicMock)
+    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", AsyncMock(return_value=[]))
+    monkeypatch.setattr(tg_adapter, "resolve_proxy_url", lambda *a, **k: None)
+    monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "0.3")
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
+    monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+
+    started = _time.monotonic()
+    try:
+        assert await _asyncio.wait_for(adapter.connect(), timeout=0.3) is False
+    finally:
+        release.set()
+        await _asyncio.sleep(0)
+    assert _time.monotonic() - started < 0.3
+    fake_app.start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_await_with_thread_deadline_returns_value_on_happy_path():
     """The real helper returns the awaited result and raises no timeout."""
     async def _ok():
