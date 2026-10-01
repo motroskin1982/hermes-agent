@@ -3350,6 +3350,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
+            # A forwarded native poll has no text and therefore cannot reach a
+            # profile's pre-dispatch safety hook through the normal text
+            # handler.  Keep its real question/options out of the generic LLM
+            # path: the receiving profile gets the raw PTB message only long
+            # enough to render a fixed, owner-authorized result.
+            self._app.add_handler(TelegramMessageHandler(
+                filters.POLL,
+                self._handle_forwarded_poll_message,
+            ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
             if ChatJoinRequestHandler is not None:
@@ -7896,6 +7905,35 @@ class TelegramAdapter(BasePlatformAdapter):
                 "update_id": int(getattr(update, "update_id", 0) or 0),
             },
         )
+
+    async def _handle_forwarded_poll_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Dispatch an owner-forwarded native poll without exposing its text to an LLM.
+
+        Only forwarded polls are eligible.  A profile pre-dispatch hook must
+        still authenticate the sender and exact Control route before it can
+        render anything; without such a hook this neutral marker is all the
+        normal gateway can see.  No poll update, voter identity, or result is
+        persisted by the adapter.
+        """
+        del context
+        message = self._effective_update_message(update)
+        if (
+            message is None
+            or getattr(message, "poll", None) is None
+            or getattr(message, "forward_origin", None) is None
+        ):
+            return
+        if not self._is_user_authorized_from_message(message):
+            return
+        if not self._should_process_message(message):
+            return
+        event = self._build_message_event(
+            message, MessageType.TEXT, update_id=getattr(update, "update_id", None)
+        )
+        event.text = "[Telegram forwarded native poll]"
+        await self.handle_message(event)
 
     async def _handle_chat_join_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Emit only allowlisted join-request identifiers to observer plugins."""
