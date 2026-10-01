@@ -81,6 +81,13 @@ CASES = {
         ],
         _lanes(python=True, scan=True, gateway_repair=True),
     ),
+    "forwarded poll adapter repair → bounded suite": (
+        [
+            "plugins/platforms/telegram/adapter.py",
+            "tests/gateway/test_telegram_forwarded_poll_event.py",
+        ],
+        _lanes(python=True, scan=True, gateway_repair=True),
+    ),
     "gateway repair plus unrelated code → full Python lane": (
         ["plugins/platforms/telegram/adapter.py", "agent/unrelated.py"],
         _lanes(python=True, scan=True),

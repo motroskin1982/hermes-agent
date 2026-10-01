@@ -91,11 +91,12 @@ jobs:
             tests/gateway/test_telegram_start_polling_timeout.py \
             tests/gateway/test_telegram_network_reconnect.py \
             tests/gateway/test_telegram_error_redaction.py \
-            tests/gateway/test_platform_reconnect.py
+            tests/gateway/test_platform_reconnect.py \
+            tests/gateway/test_telegram_forwarded_poll_event.py
       - name: Lint changed Python files
         uses: ./.github/actions/retry
         with:
-          command: uv tool run ruff check plugins/platforms/telegram/adapter.py tests/gateway/test_telegram_init_deadline.py tests/gateway/test_telegram_start_polling_timeout.py scripts/ci/classify_changes.py tests/ci/test_classify_changes.py
+          command: uv tool run ruff check plugins/platforms/telegram/adapter.py tests/gateway/test_telegram_init_deadline.py tests/gateway/test_telegram_start_polling_timeout.py tests/gateway/test_telegram_forwarded_poll_event.py scripts/ci/classify_changes.py tests/ci/test_classify_changes.py
 
   lint:
     name: Python lints

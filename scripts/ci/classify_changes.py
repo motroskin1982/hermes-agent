@@ -15,7 +15,7 @@ Lanes:
 * ``scan``        — supply-chain scan (Python files, .pth, setup hooks).
 * ``deps``        — pyproject.toml dependency bounds check.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
-* ``gateway_repair`` — the bounded Telegram bootstrap repair suite.
+* ``gateway_repair`` — the bounded Telegram adapter repair suite.
 
 Docker is not a lane — it builds on push-to-main and release only,
 never per-PR.
@@ -51,13 +51,14 @@ _MCP_CATALOG_PATHS = ("optional-mcps/",)
 _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 
 # This is deliberately an allowlist, not a directory prefix.  The bounded
-# gateway suite is only sufficient when a PR changes the bootstrap adapter and
-# the tests which prove its deadline/reconnect contract.  Any other changed
-# path must fall back to the repository-wide Python lane.
+# gateway suite is only sufficient when a PR changes the Telegram adapter and
+# the focused tests that prove its bootstrap or forwarded-poll contract.  Any
+# other changed path must fall back to the repository-wide Python lane.
 _GATEWAY_REPAIR_FILES = {
     "plugins/platforms/telegram/adapter.py",
     "tests/gateway/test_telegram_init_deadline.py",
     "tests/gateway/test_telegram_start_polling_timeout.py",
+    "tests/gateway/test_telegram_forwarded_poll_event.py",
     ".github/workflows/ci.yml",
     ".github/actions/detect-changes/action.yml",
     "scripts/ci/classify_changes.py",
@@ -83,7 +84,7 @@ def _is_mcp_catalog(p: str) -> bool:
 
 
 def _is_gateway_repair_only(files: list[str]) -> bool:
-    """Return True only for the explicitly bounded gateway-repair surface."""
+    """Return True only for the explicitly bounded Telegram adapter surface."""
     return (
         "plugins/platforms/telegram/adapter.py" in files
         and all(path in _GATEWAY_REPAIR_FILES for path in files)
