@@ -27,6 +27,9 @@ outputs:
   mcp_catalog:
     description: Require MCP catalog security review label.
     value: ${{ steps.classify.outputs.mcp_catalog }}
+  gateway_repair:
+    description: Run the bounded Telegram bootstrap repair suite.
+    value: ${{ steps.classify.outputs.gateway_repair }}
 
 runs:
   using: composite
