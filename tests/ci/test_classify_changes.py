@@ -28,10 +28,11 @@ DEFAULT = {
     "scan": True,
     "deps": True,
     "mcp_catalog": False,
+    "gateway_repair": False,
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, mcp_catalog=False, docker_meta=False) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, mcp_catalog=False, docker_meta=False, gateway_repair=False) -> dict[str, bool]:
     return {
         "python": python,
         "frontend": frontend,
@@ -40,6 +41,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, mcp
         "scan": scan,
         "deps": deps,
         "mcp_catalog": mcp_catalog,
+        "gateway_repair": gateway_repair,
     }
 
 
@@ -71,6 +73,17 @@ CASES = {
     "mcp_catalog.py → mcp_catalog": (
         ["hermes_cli/mcp_catalog.py"],
         _lanes(python=True, scan=True, mcp_catalog=True),
+    ),
+    "gateway bootstrap repair → bounded suite": (
+        [
+            "plugins/platforms/telegram/adapter.py",
+            "tests/gateway/test_telegram_init_deadline.py",
+        ],
+        _lanes(python=True, scan=True, gateway_repair=True),
+    ),
+    "gateway repair plus unrelated code → full Python lane": (
+        ["plugins/platforms/telegram/adapter.py", "agent/unrelated.py"],
+        _lanes(python=True, scan=True),
     ),
     # Fail open: CI-config / empty / blank diffs run everything.
     ".github change → all": ([".github/workflows/tests.yml"], DEFAULT),

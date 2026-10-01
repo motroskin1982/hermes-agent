@@ -15,6 +15,7 @@ Lanes:
 * ``scan``        — supply-chain scan (Python files, .pth, setup hooks).
 * ``deps``        — pyproject.toml dependency bounds check.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
+* ``gateway_repair`` — the bounded Telegram bootstrap repair suite.
 
 Docker is not a lane — it builds on push-to-main and release only,
 never per-PR.
@@ -49,6 +50,20 @@ _SCAN_FILES = {"setup.cfg", "pyproject.toml"}
 _MCP_CATALOG_PATHS = ("optional-mcps/",)
 _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 
+# This is deliberately an allowlist, not a directory prefix.  The bounded
+# gateway suite is only sufficient when a PR changes the bootstrap adapter and
+# the tests which prove its deadline/reconnect contract.  Any other changed
+# path must fall back to the repository-wide Python lane.
+_GATEWAY_REPAIR_FILES = {
+    "plugins/platforms/telegram/adapter.py",
+    "tests/gateway/test_telegram_init_deadline.py",
+    "tests/gateway/test_telegram_start_polling_timeout.py",
+    ".github/workflows/ci.yml",
+    ".github/actions/detect-changes/action.yml",
+    "scripts/ci/classify_changes.py",
+    "tests/ci/test_classify_changes.py",
+}
+
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
         return False
@@ -67,6 +82,14 @@ def _is_mcp_catalog(p: str) -> bool:
     return p.startswith(_MCP_CATALOG_PATHS) or p in _MCP_CATALOG_FILES
 
 
+def _is_gateway_repair_only(files: list[str]) -> bool:
+    """Return True only for the explicitly bounded gateway-repair surface."""
+    return (
+        "plugins/platforms/telegram/adapter.py" in files
+        and all(path in _GATEWAY_REPAIR_FILES for path in files)
+    )
+
+
 def classify(files: list[str]) -> dict[str, bool]:
     """Map changed paths to ``{lane: should_run}``."""
     files = [f.strip() for f in files if f.strip()]
@@ -78,14 +101,22 @@ def classify(files: list[str]) -> dict[str, bool]:
         "scan": any(_is_scan(f) for f in files),
         "deps": any(f == "pyproject.toml" for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
+        "gateway_repair": _is_gateway_repair_only(files),
     }
-    if not files or any(f.startswith(".github/") for f in files):
+    # CI configuration normally fails open.  The only exception is the small,
+    # self-tested gateway-repair CI surface above; letting an arbitrary
+    # workflow edit through this path would weaken the full-suite guarantee.
+    if not files or (
+        any(f.startswith(".github/") for f in files)
+        and not ret["gateway_repair"]
+    ):
         ret["python"] = True
         ret["docker_meta"] = True
         ret["frontend"] = True
         ret["site"] = True
         ret["scan"] = True
         ret["deps"] = True
+        ret["gateway_repair"] = False
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
     return ret

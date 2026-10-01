@@ -30,7 +30,7 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
 @pytest.mark.asyncio
-async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch):
+async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch, caplog):
     """A wedged initialize() attempt must not trap startup on attempt 1/8."""
     fake_app = MagicMock()
     fake_app.bot = MagicMock()
@@ -53,11 +53,15 @@ async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch
     monkeypatch.setattr(tg_adapter.asyncio, "sleep", AsyncMock())
 
     deadline_calls = 0
+    deadline_timeouts = []
 
     async def _fake_deadline(awaitable, timeout, *, on_abandon=None):
         nonlocal deadline_calls
         deadline_calls += 1
-        if deadline_calls == 1:
+        deadline_timeouts.append(timeout)
+        # DoH discovery is the first bounded phase. The first application
+        # initialization is the second.
+        if deadline_calls == 2:
             awaitable.close()
             raise tg_adapter.asyncio.TimeoutError()
         return await awaitable
@@ -76,9 +80,258 @@ async def test_connect_retries_when_initialize_wall_deadline_expires(monkeypatch
 
     assert fake_app.initialize.call_count == 2
     assert fake_app.initialize.await_count == 1
-    assert deadline_calls == 2
+    assert deadline_calls == 5
+    # The adapter leaves five seconds for GatewayRunner to classify and tear
+    # down a stalled connection instead of racing its outer 30-second limit.
+    assert all(timeout < 30.0 for timeout in deadline_timeouts)
     tg_adapter.asyncio.sleep.assert_awaited_once_with(1)
     fake_app.start.assert_awaited_once()
+    phases = [record.getMessage() for record in caplog.records if "bootstrap phase=" in record.getMessage()]
+    assert phases == [
+        "[Telegram] bootstrap phase=app_initialize_begin",
+        "[Telegram] bootstrap phase=app_initialize_begin",
+        "[Telegram] bootstrap phase=app_initialized",
+        "[Telegram] bootstrap phase=app_start_begin",
+        "[Telegram] bootstrap phase=app_started",
+        "[Telegram] bootstrap phase=webhook_clear_begin",
+        "[Telegram] bootstrap phase=webhook_clear_done result=ok",
+        "[Telegram] bootstrap phase=polling_start_begin",
+        "[Telegram] bootstrap phase=polling_start_done result=ok",
+    ]
+    assert "test-token" not in "\n".join(phases)
+
+
+@pytest.mark.asyncio
+async def test_connect_returns_before_outer_deadline_when_initialize_ignores_cancel(monkeypatch):
+    """The adapter owns a shorter deadline than GatewayRunner's outer bound.
+
+    PTB/httpcore can enter cancellation-shielded scopes.  If a hanging
+    initialize() only sees cancellation after the outer gateway timeout, the
+    runner never reaches its retry/error path.  A very short synthetic outer
+    budget makes this race deterministic without a 30-second test.
+    """
+    import asyncio as _asyncio
+    import time as _time
+
+    fake_app = MagicMock()
+    release = _asyncio.Event()
+
+    async def _cancel_resistant_initialize():
+        try:
+            await _asyncio.Future()
+        except _asyncio.CancelledError:
+            await release.wait()
+
+    fake_app.initialize = _cancel_resistant_initialize
+    fake_app.start = AsyncMock()
+    fake_app.add_handler = MagicMock()
+    fake_app.bot = MagicMock()
+
+    chainable = MagicMock()
+    chainable.token.return_value = chainable
+    chainable.request.return_value = chainable
+    chainable.get_updates_request.return_value = chainable
+    chainable.build.return_value = fake_app
+    builder_root = MagicMock()
+    builder_root.builder.return_value = chainable
+
+    monkeypatch.setattr(tg_adapter, "Application", builder_root)
+    monkeypatch.setattr(tg_adapter, "HTTPXRequest", MagicMock)
+    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", AsyncMock(return_value=[]))
+    monkeypatch.setattr(tg_adapter, "resolve_proxy_url", lambda *a, **k: None)
+    monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "0.3")
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
+    monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+
+    started = _time.monotonic()
+    try:
+        assert await _asyncio.wait_for(adapter.connect(), timeout=0.3) is False
+    finally:
+        release.set()
+        await _asyncio.sleep(0)
+    assert _time.monotonic() - started < 0.3
+    fake_app.start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_connect_does_not_sleep_past_outer_deadline_after_fast_init_error(monkeypatch):
+    """Retry backoff is part of the whole-connect budget too."""
+    import asyncio as _asyncio
+    import time as _time
+
+    fake_app = MagicMock()
+    fake_app.bot = MagicMock()
+    fake_app.initialize = AsyncMock(side_effect=OSError("fast network failure"))
+    fake_app.add_handler = MagicMock()
+
+    chainable = MagicMock()
+    chainable.token.return_value = chainable
+    chainable.request.return_value = chainable
+    chainable.get_updates_request.return_value = chainable
+    chainable.build.return_value = fake_app
+    builder_root = MagicMock()
+    builder_root.builder.return_value = chainable
+
+    monkeypatch.setattr(tg_adapter, "Application", builder_root)
+    monkeypatch.setattr(tg_adapter, "HTTPXRequest", MagicMock)
+    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", AsyncMock(return_value=[]))
+    monkeypatch.setattr(tg_adapter, "resolve_proxy_url", lambda *a, **k: None)
+    monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "0.3")
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
+    monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+
+    started = _time.monotonic()
+    assert await _asyncio.wait_for(adapter.connect(), timeout=0.3) is False
+    assert _time.monotonic() - started < 0.3
+    assert fake_app.initialize.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_connect_returns_before_outer_deadline_when_polling_ignores_cancel(monkeypatch):
+    """A wedged first getUpdates start must fail before GatewayRunner does."""
+    import asyncio as _asyncio
+    import time as _time
+
+    release = _asyncio.Event()
+
+    async def _cancel_resistant_polling(**_kwargs):
+        try:
+            await _asyncio.Future()
+        except _asyncio.CancelledError:
+            await release.wait()
+
+    fake_bot = MagicMock()
+    fake_bot.delete_webhook = AsyncMock(return_value=True)
+    fake_app = MagicMock()
+    fake_app.bot = fake_bot
+    fake_app.initialize = AsyncMock()
+    fake_app.start = AsyncMock()
+    fake_app.shutdown = AsyncMock()
+    fake_app.add_handler = MagicMock()
+    fake_app.updater = MagicMock()
+    fake_app.updater.start_polling = _cancel_resistant_polling
+
+    chainable = MagicMock()
+    chainable.token.return_value = chainable
+    chainable.request.return_value = chainable
+    chainable.get_updates_request.return_value = chainable
+    chainable.build.return_value = fake_app
+    builder_root = MagicMock()
+    builder_root.builder.return_value = chainable
+
+    monkeypatch.setattr(tg_adapter, "Application", builder_root)
+    monkeypatch.setattr(tg_adapter, "HTTPXRequest", MagicMock)
+    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", AsyncMock(return_value=[]))
+    monkeypatch.setattr(tg_adapter, "resolve_proxy_url", lambda *a, **k: None)
+    monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "0.3")
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
+    monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+
+    started = _time.monotonic()
+    try:
+        assert await _asyncio.wait_for(adapter.connect(), timeout=0.3) is False
+    finally:
+        release.set()
+        await _asyncio.sleep(0)
+    assert _time.monotonic() - started < 0.3
+    assert adapter.is_connected is False
+    assert adapter._polling_error_task is None
+
+
+@pytest.mark.asyncio
+async def test_connect_budget_starts_before_cancellation_resistant_fallback_discovery(monkeypatch):
+    """DoH is part of the same whole-connect deadline, not preamble time."""
+    import asyncio as _asyncio
+    import time as _time
+
+    release = _asyncio.Event()
+
+    async def _cancel_resistant_discovery():
+        try:
+            await _asyncio.Future()
+        except _asyncio.CancelledError:
+            await release.wait()
+
+    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", _cancel_resistant_discovery)
+    monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "0.3")
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
+    monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+
+    started = _time.monotonic()
+    try:
+        assert await _asyncio.wait_for(adapter.connect(), timeout=0.3) is False
+    finally:
+        release.set()
+        await _asyncio.sleep(0)
+    assert _time.monotonic() - started < 0.3
+
+
+@pytest.mark.asyncio
+async def test_connect_returns_before_outer_deadline_when_webhook_ignores_cancel(monkeypatch):
+    """Webhook startup gets the same detached whole-connect deadline."""
+    import asyncio as _asyncio
+    import agent.secret_scope as secret_scope
+    import time as _time
+
+    release = _asyncio.Event()
+
+    async def _cancel_resistant_webhook(**_kwargs):
+        try:
+            await _asyncio.Future()
+        except _asyncio.CancelledError:
+            await release.wait()
+
+    fake_app = MagicMock()
+    fake_app.bot = MagicMock()
+    fake_app.initialize = AsyncMock()
+    fake_app.start = AsyncMock()
+    fake_app.shutdown = AsyncMock()
+    fake_app.add_handler = MagicMock()
+    fake_app.updater = MagicMock()
+    fake_app.updater.start_webhook = _cancel_resistant_webhook
+
+    chainable = MagicMock()
+    chainable.token.return_value = chainable
+    chainable.request.return_value = chainable
+    chainable.get_updates_request.return_value = chainable
+    chainable.build.return_value = fake_app
+    builder_root = MagicMock()
+    builder_root.builder.return_value = chainable
+
+    monkeypatch.setattr(tg_adapter, "Application", builder_root)
+    monkeypatch.setattr(tg_adapter, "HTTPXRequest", MagicMock)
+    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", AsyncMock(return_value=[]))
+    monkeypatch.setattr(tg_adapter, "resolve_proxy_url", lambda *a, **k: None)
+    monkeypatch.setattr(
+        secret_scope,
+        "get_secret",
+        lambda name, default="": {
+            "TELEGRAM_WEBHOOK_URL": "https://example.invalid/telegram",
+            "TELEGRAM_WEBHOOK_SECRET": "test-webhook-secret",
+        }.get(name, default),
+    )
+    monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "0.3")
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *a, **k: True)
+    monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+
+    started = _time.monotonic()
+    try:
+        assert await _asyncio.wait_for(adapter.connect(), timeout=0.3) is False
+    finally:
+        release.set()
+        await _asyncio.sleep(0)
+    assert _time.monotonic() - started < 0.3
+    assert adapter.is_connected is False
 
 
 @pytest.mark.asyncio
