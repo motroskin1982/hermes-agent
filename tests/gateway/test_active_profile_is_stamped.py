@@ -17,6 +17,10 @@ import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
+from gateway.config import GatewayConfig, Platform
+from gateway.session import SessionSource, SessionStore
+from hermes_state import SessionDB
+
 RUN_PY = (Path(__file__).resolve().parents[2] / "gateway" / "run.py").read_text()
 
 
@@ -79,3 +83,63 @@ def test_stamping_cannot_break_message_handling():
     assert asyncio.run(handler(SimpleNamespace(source=None))) == "ok"
     assert reached == [True]
     assert inspect.iscoroutinefunction(handler)
+
+
+def test_stamped_gateway_profile_survives_sqlite_create_and_reset(tmp_path, monkeypatch):
+    """An event stamp is not enough: Nova's tools read the persisted row."""
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    db = store._db
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="control-chat",
+        chat_type="group",
+        user_id="owner",
+        thread_id="control-topic",
+        profile="nova-teen-club",
+    )
+
+    first = store.get_or_create_session(source)
+    assert db.get_session(first.session_id)["profile_name"] == "nova-teen-club"
+
+    reset = store.reset_session(first.session_key)
+    assert reset is not None
+    assert db.get_session(reset.session_id)["profile_name"] == "nova-teen-club"
+    db.close()
+
+
+def test_primary_handler_stamps_the_row_seen_by_nova_tools(tmp_path, monkeypatch):
+    import hermes_state
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    runner = object.__new__(GatewayRunner)
+
+    async def _handle(event):
+        return store.get_or_create_session(event.source)
+
+    runner._handle_message = _handle
+    event = SimpleNamespace(source=SessionSource(
+        platform=Platform.TELEGRAM, chat_id="control-chat", user_id="owner",
+    ))
+    handler = GatewayRunner._make_profile_message_handler(runner, "nova-teen-club")
+    entry = asyncio.run(handler(event))
+
+    assert event.source.profile == "nova-teen-club"
+    assert store._db.get_session(entry.session_id)["profile_name"] == "nova-teen-club"
+    store._db.close()
+
+
+def test_unstamped_or_different_profile_is_not_falsely_stamped(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("untrusted", source="telegram")
+    db.create_session("untrusted", source="telegram", profile_name="nova-teen-club")
+    db.create_session("foreign", source="telegram", profile_name="other-profile")
+    db.create_session("foreign", source="telegram", profile_name="nova-teen-club")
+
+    assert db.get_session("untrusted")["profile_name"] is None
+    assert db.get_session("foreign")["profile_name"] == "other-profile"
+    db.close()
