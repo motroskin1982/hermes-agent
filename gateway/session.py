@@ -2304,6 +2304,11 @@ class SessionStore:
         db_end_session_id = None
         new_entry = None
 
+        if self._db:
+            target = self._db.get_session(target_session_id)
+            if target and target.get("end_reason") == "nova_profile_quarantined":
+                return None
+
         with self._lock:
             self._ensure_loaded_locked()
 

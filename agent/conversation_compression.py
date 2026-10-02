@@ -800,12 +800,25 @@ def compress_context(
                         pass
                     agent._session_db_created = False
                     try:
+                        session_source = agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli")
+                        parent_row = agent._session_db.get_session(old_session_id)
+                        peer_metadata = {}
+                        if isinstance(parent_row, dict) and parent_row.get("source") == session_source:
+                            # A continuation keeps the parent's verified routing
+                            # identity. Never infer a profile for an unstamped
+                            # parent or copy identity across platform sources.
+                            peer_metadata = {
+                                key: parent_row.get(key)
+                                for key in ("profile_name", "user_id", "session_key",
+                                            "chat_id", "chat_type", "thread_id")
+                            }
                         agent._session_db.create_session(
                             session_id=agent.session_id,
-                            source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                            source=session_source,
                             model=agent.model,
                             model_config=agent._session_init_model_config,
                             parent_session_id=old_session_id,
+                            **peer_metadata,
                         )
                     except Exception as _cs_err:
                         # The child row could not be created (e.g. FK constraint,

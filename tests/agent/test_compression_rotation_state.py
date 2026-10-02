@@ -21,6 +21,8 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hermes_state import SessionDB
 
 
@@ -130,3 +132,21 @@ class TestPlatformForwardedAtBoundary:
         kwargs = calls[-1].kwargs
         assert kwargs.get("platform") == "telegram"
         assert kwargs.get("boundary_reason") == "compression"
+
+
+@pytest.mark.parametrize("parent_source,profile", [
+    ("telegram", "nova-teen-club"), ("telegram", None), ("cli", "other-profile"),
+])
+def test_compression_carries_only_same_source_parent_identity(tmp_path, monkeypatch, parent_source, profile):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    metadata = dict(profile_name=profile, user_id="owner", chat_id="control",
+                    chat_type="group", thread_id="topic", session_key="routing-key")
+    db.create_session("parent", source=parent_source, **metadata)
+    agent = _build_agent_with_db(db, "parent", platform="telegram")
+    agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+    assert agent.session_id != "parent"
+    child = db.get_session(agent.session_id)
+    for key, value in metadata.items():
+        assert child[key] == (value if parent_source == "telegram" else None)
+    db.close()

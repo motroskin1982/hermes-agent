@@ -17,6 +17,8 @@ import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
 from hermes_state import SessionDB
@@ -143,3 +145,53 @@ def test_unstamped_or_different_profile_is_not_falsely_stamped(tmp_path):
     assert db.get_session("untrusted")["profile_name"] is None
     assert db.get_session("foreign")["profile_name"] == "other-profile"
     db.close()
+
+
+def test_quarantine_preserves_history_and_cannot_be_resumed(tmp_path, monkeypatch):
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="control",
+                           user_id="owner", profile="nova-teen-club")
+    old = store.get_or_create_session(source)
+    store._db.append_message(old.session_id, role="user", content="synthetic history")
+    store._db.end_session(old.session_id, "nova_profile_quarantined")
+    fresh = store.get_or_create_session(source)
+    assert fresh.session_id != old.session_id
+    assert store._db.get_session(fresh.session_id)["profile_name"] == "nova-teen-club"
+    assert store.switch_session(fresh.session_key, old.session_id) is None
+    with pytest.raises(ValueError, match="cannot be resumed"):
+        store._db.reopen_session(old.session_id)
+    assert store._db.get_messages(old.session_id)[0]["content"] == "synthetic history"
+    store._db.close()
+
+
+def test_branch_command_preserves_profile_and_peer(tmp_path, monkeypatch):
+    import hermes_state
+    from hermes_state import AsyncSessionDB
+    from gateway.session import AsyncSessionStore
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+    from gateway.platforms.base import MessageEvent
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="control",
+                           user_id="owner", chat_type="group", thread_id="topic",
+                           profile="nova-teen-club")
+    old = store.get_or_create_session(source)
+    store._db.append_message(old.session_id, role="user", content="synthetic history")
+    runner = SimpleNamespace(
+        _session_db=AsyncSessionDB(store._db), async_session_store=AsyncSessionStore(store),
+        _session_key_for_source=lambda src: old.session_key, config={},
+        _clear_session_boundary_security_state=lambda key: None,
+        _evict_cached_agent=lambda key: None,
+    )
+    asyncio.run(GatewaySlashCommandsMixin._handle_branch_command(
+        runner, MessageEvent(text="/branch example", source=source)))
+    fresh = store.get_or_create_session(source)
+    assert fresh.session_id != old.session_id
+    row = store._db.get_session(fresh.session_id)
+    assert row["profile_name"] == "nova-teen-club"
+    assert (row["user_id"], row["chat_id"], row["thread_id"]) == ("owner", "control", "topic")
+    store._db.close()

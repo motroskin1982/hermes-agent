@@ -2124,6 +2124,11 @@ class SessionDB:
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
         def _do(conn):
+            row = conn.execute(
+                "SELECT end_reason FROM sessions WHERE id = ?", (session_id,),
+            ).fetchone()
+            if row is not None and row[0] == "nova_profile_quarantined":
+                raise ValueError("Unverified profile session cannot be resumed")
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
