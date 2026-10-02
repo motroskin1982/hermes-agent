@@ -15,9 +15,12 @@ jobs:
           fetch-depth: 0  # Full history needed for git log
 
       - name: Check for unmapped contributor emails
+        env:
+          PR_BASE_REF: ${{ github.base_ref }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # A maintenance PR must be compared with its actual target branch,
+          # not every historical fork commit absent from upstream main.
+          MERGE_BASE=$(git merge-base "origin/${PR_BASE_REF:-main}" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
@@ -32,7 +35,9 @@ jobs:
           while IFS= read -r email; do
             # Skip teknium and bot emails
             case "$email" in
-              *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*)
+              *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*|codex@localhost)
+                # codex@localhost is the local automation author, not a
+                # human GitHub account. Preserve its real commit attribution.
                 continue ;;
             esac
 
