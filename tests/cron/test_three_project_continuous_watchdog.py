@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path("/srv/hermes/state/scripts/hermes_three_project_continuous_watchdog.py")
+SCRIPT = Path(__file__).resolve().parents[2] / "cron" / "three_project_continuous_watchdog.py"
 
 
 @pytest.fixture

@@ -3480,6 +3480,7 @@ class GatewaySlashCommandsMixin:
                     chat_id=source.chat_id,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
+                    profile_name=source.profile,
                 )
             except Exception:
                 pass  # Session might already exist, ignore errors
@@ -3821,6 +3822,12 @@ class GatewaySlashCommandsMixin:
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
                 model_config={"_branched_from": parent_session_id},
                 parent_session_id=parent_session_id,
+                profile_name=source.profile,
+                user_id=source.user_id,
+                session_key=current_entry.session_key,
+                chat_id=source.chat_id,
+                chat_type=source.chat_type,
+                thread_id=source.thread_id,
             )
         except Exception as e:
             logger.error("Failed to create branch session: %s", e)

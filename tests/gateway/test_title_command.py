@@ -58,6 +58,17 @@ class TestHandleTitleCommand:
     """Tests for GatewayRunner._handle_title_command."""
 
     @pytest.mark.asyncio
+    async def test_title_fallback_persists_ingress_profile(self, tmp_path):
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        runner = _make_runner(session_db=db)
+        event = _make_event(text="/title example")
+        event.source.profile = "nova-teen-club"
+        await runner._handle_title_command(event)
+        assert db.get_session("test_session_123")["profile_name"] == "nova-teen-club"
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_set_title(self, tmp_path):
         """Setting a title returns confirmation."""
         from hermes_state import SessionDB

@@ -7104,6 +7104,10 @@ def _contain_spawned_worker(pid: int, *, grace_seconds: float = 1.0) -> bool:
     pid = int(pid or 0)
     if pid <= 1:
         return True
+    if _IS_WINDOWS:
+        # No POSIX process-group API exists here. Never release a live
+        # worker's claim/capacity merely because containment is unsupported.
+        return not _pid_alive(pid)
     try:
         pgid = os.getpgid(pid)
         sid = os.getsid(pid)
@@ -7111,7 +7115,7 @@ def _contain_spawned_worker(pid: int, *, grace_seconds: float = 1.0) -> bool:
         return True
     try:
         if pgid == pid and sid == pid:
-            os.killpg(pid, signal.SIGTERM)
+            os.killpg(pid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only after guard
         else:
             os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -7123,9 +7127,9 @@ def _contain_spawned_worker(pid: int, *, grace_seconds: float = 1.0) -> bool:
         time.sleep(0.02)
     try:
         if pgid == pid and sid == pid:
-            os.killpg(pid, signal.SIGKILL)
+            os.killpg(pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only after guard
         else:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only after guard
     except ProcessLookupError:
         return True
     deadline = time.monotonic() + 1.0

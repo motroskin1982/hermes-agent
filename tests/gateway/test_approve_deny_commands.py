@@ -21,6 +21,15 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
 
+@pytest.fixture(autouse=True)
+def manual_approval_config(monkeypatch):
+    # This module tests the human approve/deny queue, not the auxiliary LLM's
+    # smart-approval policy. Keep its input explicit and independent of host
+    # credentials, provider discovery and the default configuration mode.
+    monkeypatch.setattr("tools.approval._get_approval_config",
+                        lambda: {"mode": "manual", "timeout": 5})
+
+
 def _make_source() -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,

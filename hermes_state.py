@@ -723,6 +723,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     chat_id TEXT,
     chat_type TEXT,
     thread_id TEXT,
+    profile_name TEXT,
     display_name TEXT,
     origin_json TEXT,
     expiry_finalized INTEGER DEFAULT 0,
@@ -1693,6 +1694,7 @@ class SessionDB:
         chat_id: str = None,
         chat_type: str = None,
         thread_id: str = None,
+        profile_name: str = None,
         parent_session_id: str = None,
         cwd: str = None,
     ) -> None:
@@ -1713,14 +1715,18 @@ class SessionDB:
         a persisted, now-inactive row belongs to the caller's chat/thread before
         switching to it (IDOR scoping — without them the ``sessions`` table has
         no chat/thread to compare).
+
+        ``profile_name`` comes from the gateway-stamped inbound source at row
+        creation. Do not backfill it on conflict: an older unstamped session
+        must not gain profile-scoped authority retroactively.
         """
         def _do(conn):
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                   model, model_config, system_prompt, parent_session_id, cwd, started_at
+                   profile_name, model, model_config, system_prompt, parent_session_id, cwd, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -1739,6 +1745,7 @@ class SessionDB:
                     chat_id,
                     chat_type,
                     thread_id,
+                    profile_name,
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
@@ -2117,6 +2124,11 @@ class SessionDB:
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
         def _do(conn):
+            row = conn.execute(
+                "SELECT end_reason FROM sessions WHERE id = ?", (session_id,),
+            ).fetchone()
+            if row is not None and row[0] == "nova_profile_quarantined":
+                raise ValueError("Unverified profile session cannot be resumed")
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),

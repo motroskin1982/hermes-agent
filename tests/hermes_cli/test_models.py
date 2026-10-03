@@ -2,6 +2,8 @@
 
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from hermes_cli.nous_account import NousPortalAccountInfo
 from hermes_cli.models import (
     OPENROUTER_MODELS, fetch_openrouter_models, model_ids, detect_provider_for_model,
@@ -58,6 +60,14 @@ class TestOpenRouterModels:
 
 
 class TestFetchOpenRouterModels:
+    @pytest.fixture(autouse=True)
+    def static_catalog(self, monkeypatch):
+        # These tests exercise live pricing/tool filtering against the static
+        # fixture, not a mutable remotely hosted curated manifest.
+        monkeypatch.setattr(
+            "hermes_cli.model_catalog.get_curated_openrouter_models", lambda: []
+        )
+
     def test_live_fetch_recomputes_free_tags(self, monkeypatch):
         class _Resp:
             def __enter__(self):
