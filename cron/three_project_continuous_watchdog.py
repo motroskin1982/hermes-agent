@@ -114,12 +114,6 @@ def external_state(project, writer_id, records):
             raise InvalidEvidence("conflicting allocation routing")
         if not isinstance(record.get("origin"), str):
             raise InvalidEvidence("invalid allocation origin")
-        if record.get("origin") not in ORIGINS:
-            status = record.get("status", record.get("state"))
-            if not isinstance(status, str) or status not in TERMINAL:
-                raise InvalidEvidence("unknown origin may hold active work")
-            unrouted = True
-            continue
         status, state = record.get("status"), record.get("state")
         if status is not None and state is not None and status != state:
             raise InvalidEvidence("conflicting allocation state")
@@ -129,6 +123,11 @@ def external_state(project, writer_id, records):
         if not any(isinstance(record.get(key), str) and record[key].strip()
                    for key in ("task_id", "session_id", "job_id", "idempotency_key")):
             raise InvalidEvidence("allocation lacks stable identity")
+        if record.get("origin") not in ORIGINS:
+            if status not in TERMINAL:
+                raise InvalidEvidence("unknown origin may hold active work")
+            unrouted = True
+            continue
         if status in BLOCKED:
             return "BLOCKED"
         active = active or status in ACTIVE

@@ -130,6 +130,21 @@ def test_ambiguous_allocation_fails_closed(home, monkeypatch, record):
     assert watchdog.run(home, now=NOW)["status"] == "blocked"
 
 
+@pytest.mark.parametrize("fields", [
+    {"task_id": "x", "status": "done", "state": "running"},
+    {"task_id": "x", "status": "done", "state": "paused"},
+    {"task_id": "x", "status": "done", "state": []},
+    {"status": "done"},
+])
+def test_unknown_origin_cannot_bypass_state_or_identity_validation(home, monkeypatch, fields):
+    record = {"project": "Ruta", "origin": "future_allocator", **fields}
+    with pytest.raises(watchdog.InvalidEvidence):
+        watchdog.external_state("Ruta", watchdog.PROJECTS["Ruta"], [record])
+    (home / "runtime" / "cross-channel-work.json").write_text(json.dumps([record]))
+    monkeypatch.setattr(watchdog, "trigger", pytest.fail)
+    assert watchdog.run(home, now=NOW)["status"] == "blocked"
+
+
 @pytest.mark.parametrize("field,value", [
     ("last_run_at", (NOW + timedelta(seconds=1)).isoformat()),
     ("last_run_at", "2026-01-01T00:00:00"),
